@@ -2,7 +2,7 @@
 
 将 Google Flow 的图片和视频生成能力封装为 Gemini 请求体兼容 API，并通过仓库自带的 Chrome 扩展同步当前浏览器账号、刷新 ST/AT 和处理 reCAPTCHA。
 
-本仓库是 [TheSmallHanCat/flow2api](https://github.com/TheSmallHanCat/flow2api) 的个人维护分支，保留上游核心能力，并针对原生运行、浏览器插件同步、公开模型名和管理后台做了调整。
+本仓库是 [zAhYAng/flow2api](https://github.com/zAhYAng/flow2api) 的维护版本，保留上游核心能力，并针对原生运行、浏览器插件同步、公开模型名和管理后台做了调整。
 
 ## 主要变化
 
@@ -34,7 +34,7 @@
 要求 Python 3.10+，推荐使用虚拟环境：
 
 ```bash
-git clone https://github.com/Danborad/flow2api.git
+git clone https://github.com/zAhYAng/flow2api.git
 cd flow2api
 
 python3 -m venv .venv
@@ -263,7 +263,8 @@ Prometheus: http://127.0.0.1:8000/metrics
 
 - [浏览器插件配置](docs/captcha-worker-setup.md)
 - [模型路由规则](docs/model-aliases.md)
-- [原作者仓库](https://github.com/TheSmallHanCat/flow2api)
+- [本项目仓库](https://github.com/zAhYAng/flow2api)
+- [上游原作者仓库](https://github.com/TheSmallHanCat/flow2api)
 
 ## 许可证
 
