@@ -1345,7 +1345,6 @@ class GenerationHandler:
     ) -> None:
         """后台提交 Flow 视频生成请求"""
         try:
-            # 复用现有提交逻辑
             model_config = MODEL_CONFIG[model]
             
             # Track pending
@@ -1354,11 +1353,25 @@ class GenerationHandler:
             try:
                 token = await self.db.get_token(token_id)
                 if not token:
-                    raise ValueError("Video account is no longer available")
+                    await self.db.update_task(
+                        local_id,
+                        status="failed",
+                        error_code=503,
+                        error_message="Video account is no longer available",
+                        completed_at=time.time(),
+                    )
+                    return
                 
                 token = await self.token_manager.ensure_valid_token(token)
                 if not token:
-                    raise ValueError("Video access token is invalid")
+                    await self.db.update_task(
+                        local_id,
+                        status="failed",
+                        error_code=503,
+                        error_message="Video access token is invalid",
+                        completed_at=time.time(),
+                    )
+                    return
                 
                 if not supports_model_for_tier(model, token.user_paygate_tier):
                     await self.db.update_task(
@@ -1425,12 +1438,53 @@ class GenerationHandler:
                 
                 operations = result.get("operations") or []
                 if not operations:
-                    raise RuntimeError("Video submission returned no operation")
+                    await self.db.update_task(
+                        local_id,
+                        status="failed",
+                        error_code=502,
+                        error_message="Video submission returned no operation",
+                        completed_at=time.time(),
+                    )
+                    return
                 
                 operation = operations[0]
                 upstream_operation_id = (operation.get("operation") or {}).get("name")
                 if not upstream_operation_id:
-                    raise RuntimeError("Video submission returned no operation ID")
+                    await self.db.update_task(
+                        local_id,
+                        status="failed",
+                        error_code=502,
+                        error_message="Video submission returned no operation ID",
+                        completed_at=time.time(),
+                    )
+                    return
+                
+                # 创建 request log（使用本地 operation name）
+                request_payload = {
+                    "model": model,
+                    "prompt": prompt,
+                    "has_images": bool(images),
+                    "protocol": "gemini_predictLongRunning",
+                    "operation_name": f"operations/{local_id}",
+                    "upstream_operation_id": upstream_operation_id,
+                }
+                response_payload = {
+                    "status": "processing",
+                    "status_text": "video_submitting",
+                    "progress": 25,
+                    "name": f"operations/{local_id}",
+                    "upstream_operation_id": upstream_operation_id,
+                }
+                log_id = await self._log_request(
+                    token_id=token.id,
+                    operation="generate_video",
+                    request_data=request_payload,
+                    response_data=response_payload,
+                    status_code=102,
+                    duration=0.0,
+                    status_text="video_submitting",
+                    progress=25,
+                )
                 
                 # 更新为 processing 状态
                 await self.db.update_task(
@@ -1440,6 +1494,7 @@ class GenerationHandler:
                     project_id=project_id,
                     scene_id=operation.get("sceneId"),
                     media_name=operation.get("mediaName") or upstream_operation_id,
+                    request_log_id=log_id,
                     progress=25,
                 )
                 
@@ -1447,9 +1502,12 @@ class GenerationHandler:
                 await self.load_balancer.release_pending(token_id, for_video_generation=True)
                 
         except ValueError as e:
-            # 权限或账号问题
+            # 参数验证失败（图片数量不匹配等）
             error_msg = str(e)
-            error_code = 403 if "tier" in error_msg.lower() or "support" in error_msg.lower() else 400
+            # 检查是否是权限/层级错误
+            error_code = 400
+            if "tier" in error_msg.lower() or "support" in error_msg.lower():
+                error_code = 403
             await self.db.update_task(
                 local_id,
                 status="failed",
@@ -1458,7 +1516,7 @@ class GenerationHandler:
                 completed_at=time.time(),
             )
         except Exception as e:
-            # 普通上游失败
+            # 未分类错误
             await self.db.update_task(
                 local_id,
                 status="failed",
@@ -1469,6 +1527,7 @@ class GenerationHandler:
         finally:
             # 清理后台任务追踪
             self._background_submissions.pop(local_id, None)
+
 
     async def wait_for_gemini_video_submission(self, name: str, timeout: float = 30.0) -> None:
         """等待后台提交完成（测试辅助方法）"""
