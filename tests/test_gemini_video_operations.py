@@ -1,3 +1,5 @@
+import asyncio
+import json
 import tempfile
 import sqlite3
 import base64
@@ -12,7 +14,7 @@ from fastapi.testclient import TestClient
 from src.api import routes
 from src.core.auth import verify_api_key_flexible
 from src.core.database import Database
-from src.core.models import Token
+from src.core.models import Task, Token
 from src.services.generation_handler import GenerationHandler
 
 
@@ -281,6 +283,31 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp.cleanup()
 
+    async def _assert_failed_operation(self, name, error_code):
+        """核对真实任务、轮询结果和持久化日志的失败语义。"""
+        task = await self.db.get_task(name.removeprefix("operations/"))
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(task.error_code, error_code)
+        self.assertIsNotNone(task.completed_at)
+        error = {"code": error_code, "message": task.error_message}
+        self.assertEqual(await self.handler.get_gemini_video_operation(name), {
+            "name": name, "done": True, "error": error,
+        })
+        self.assertIsNotNone(task.request_log_id)
+        log = await self.db.get_log_detail(task.request_log_id)
+        self.assertIsNotNone(log)
+        self.assertEqual(log["operation"], "generate_video")
+        self.assertEqual(log["status_code"], error_code)
+        self.assertEqual(log["status_text"], "video_failed")
+        self.assertEqual(log["progress"], 0)
+        request = json.loads(log["request_body"])
+        self.assertEqual(request["operation_name"], name)
+        self.assertEqual(request.get("protocol"), "gemini_predictLongRunning")
+        response = json.loads(log["response_body"])
+        self.assertEqual(response.get("name"), name)
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error"], error)
+
     async def test_operation_survives_new_handler_and_polls_upstream(self):
         name = await self.handler.submit_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="a cat", images=[])
         self.assertEqual(name, "operations/op-123")
@@ -378,6 +405,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.status, "failed")
         self.assertEqual(task.error_code, 403)
         self.assertIn("tier", task.error_message.lower())
+        await self._assert_failed_operation(name, 403)
 
     async def test_enqueue_with_upstream_failure_persists_gemini_error(self):
         """后台提交遇到普通上游失败时持久化 Gemini 错误"""
@@ -387,11 +415,12 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         local_id = name.replace("operations/", "")
         task = await self.db.get_task(local_id)
         self.assertEqual(task.status, "failed")
-        self.assertEqual(task.error_code, 500)
+        self.assertEqual(task.error_code, 502)
         failed = await self.handler.get_gemini_video_operation(name)
         self.assertTrue(failed["done"])
         self.assertIn("error", failed)
-        self.assertEqual(failed["error"]["code"], 500)
+        self.assertEqual(failed["error"]["code"], 502)
+        await self._assert_failed_operation(name, 502)
 
     async def test_enqueue_creates_request_log_and_stores_log_id(self):
         """异步提交成功时必须创建 request log，记录本地 operation name"""
@@ -404,10 +433,14 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         # 必须有 request_log_id
         self.assertIsNotNone(task.request_log_id, "request_log_id must be set")
         
-        # 查询日志，验证内容
-        # （这里假设 db 有查询方法，实际可能需要直接 SQL 查询）
-        # 预期：protocol=gemini_predictLongRunning, status_code=102, status_text=video_submitting, progress=25
-        # operation_name 应使用本地 operation name
+        log = await self.db.get_log_detail(task.request_log_id)
+        self.assertEqual(log["status_code"], 102)
+        self.assertEqual(log["status_text"], "video_submitting")
+        self.assertEqual(log["progress"], 25)
+        request = json.loads(log["request_body"])
+        self.assertEqual(request["operation_name"], name)
+        self.assertEqual(request["protocol"], "gemini_predictLongRunning")
+        self.assertEqual(request["upstream_operation_id"], "op-123")
 
     async def test_release_pending_called_exactly_once_on_success(self):
         """成功提交路径必须恰好 release_pending 一次"""
@@ -441,13 +474,18 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_code_403_for_permission_denied(self):
         """权限/层级拒绝必须使用 error_code=403"""
-        self.flow.generate_video_text.side_effect = ValueError("Account tier does not support this video model")
-        name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
-        await self.handler.wait_for_gemini_video_submission(name)
-        
-        local_id = name.replace("operations/", "")
-        task = await self.db.get_task(local_id)
-        self.assertEqual(task.error_code, 403)
+        for error in (
+            RuntimeError("Flow API request failed: PUBLIC_ERROR_MODEL_ACCESS_DENIED"),
+            RuntimeError("Flow API request failed: PERMISSION_DENIED"),
+            ValueError("PERMISSION_DENIED: Selected account cannot access the model"),
+        ):
+            with self.subTest(error=str(error)):
+                self.flow.generate_video_text.side_effect = error
+                name = await self.handler.enqueue_gemini_video(
+                    model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+                )
+                await self.handler.wait_for_gemini_video_submission(name)
+                await self._assert_failed_operation(name, 403)
 
     async def test_error_code_503_for_invalid_token(self):
         """无效 Token 必须使用 error_code=503"""
@@ -459,16 +497,21 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         local_id = name.replace("operations/", "")
         task = await self.db.get_task(local_id)
         self.assertEqual(task.error_code, 503)
+        await self._assert_failed_operation(name, 503)
 
     async def test_error_code_502_for_upstream_api_failure(self):
         """上游 API 失败（无 operations、无 operation ID）必须使用 error_code=502"""
-        self.flow.generate_video_text.return_value = {"operations": []}  # 无 operations
-        name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
-        await self.handler.wait_for_gemini_video_submission(name)
-        
-        local_id = name.replace("operations/", "")
-        task = await self.db.get_task(local_id)
-        self.assertEqual(task.error_code, 502)
+        for result in (
+            {"operations": []},
+            {"operations": [{"operation": {}, "mediaName": "media-123", "projectId": "project-1"}]},
+        ):
+            with self.subTest(result=result):
+                self.flow.generate_video_text.return_value = result
+                name = await self.handler.enqueue_gemini_video(
+                    model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+                )
+                await self.handler.wait_for_gemini_video_submission(name)
+                await self._assert_failed_operation(name, 502)
 
     async def test_wait_exposes_background_task_exceptions(self):
         """wait_for_gemini_video_submission 必须暴露后台异常，不能只超时"""
@@ -503,6 +546,186 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         result = await self.handler.get_gemini_video_operation(name)
         self.assertTrue(result["done"])
         self.assertEqual(result["error"]["code"], 503)
+
+
+    async def test_wait_exposes_uncaught_background_exception_immediately(self):
+        """wait 必须快速暴露后台未捕获异常，不能只轮询 DB"""
+        local_id = "uncaught-submission"
+        name = f"operations/{local_id}"
+        await self.db.create_task(Task(
+            task_id=local_id, token_id=self.token.id,
+            model="veo_3_1_t2v_fast_landscape", prompt="cat", status="submitting",
+        ))
+
+        async def failing_coroutine():
+            try:
+                await asyncio.sleep(0)
+                raise RuntimeError("Simulated unhandled background error")
+            finally:
+                self.handler._background_submissions.pop(local_id, None)
+
+        failing_task = asyncio.create_task(failing_coroutine())
+        self.handler._background_submissions[local_id] = failing_task
+        start = asyncio.get_running_loop().time()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Simulated unhandled background error"):
+                await asyncio.wait_for(
+                    self.handler.wait_for_gemini_video_submission(name, timeout=30.0),
+                    timeout=2.0,
+                )
+            self.assertLess(asyncio.get_running_loop().time() - start, 2.0)
+        finally:
+            if not failing_task.done():
+                failing_task.cancel()
+            await asyncio.gather(failing_task, return_exceptions=True)
+            self.handler._background_submissions.pop(local_id, None)
+
+    async def test_wait_timeout_does_not_cancel_background_submission(self):
+        """等待超时后提交仍存活，并能完成真实的数据库状态转换。"""
+        local_id = "slow-submission"
+        name = f"operations/{local_id}"
+        await self.db.create_task(Task(
+            task_id=local_id, token_id=self.token.id,
+            model="veo_3_1_t2v_fast_landscape", prompt="cat", status="submitting",
+        ))
+        release = asyncio.Event()
+
+        async def slow_submission():
+            try:
+                await release.wait()
+                await self.db.update_task(local_id, status="processing", upstream_operation_id="op-123")
+            finally:
+                self.handler._background_submissions.pop(local_id, None)
+
+        background_task = asyncio.create_task(slow_submission())
+        self.handler._background_submissions[local_id] = background_task
+        try:
+            with self.assertRaises(TimeoutError):
+                await self.handler.wait_for_gemini_video_submission(name, timeout=0.01)
+            self.assertFalse(background_task.done())
+            release.set()
+            await asyncio.wait_for(background_task, timeout=2.0)
+            self.assertEqual((await self.db.get_task(local_id)).status, "processing")
+        finally:
+            release.set()
+            if not background_task.done():
+                background_task.cancel()
+            await asyncio.gather(background_task, return_exceptions=True)
+            self.handler._background_submissions.pop(local_id, None)
+
+    async def test_get_operation_reads_fresh_state_when_bg_task_missing(self):
+        """get_operation 读取到 submitting 后，后台任务不存在时必须重新读取 DB"""
+        name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
+        local_id = name.replace("operations/", "")
+
+        # 等待提交完成
+        await self.handler.wait_for_gemini_video_submission(name)
+
+        fresh_task = await self.db.get_task(local_id)
+        self.assertEqual(fresh_task.status, "processing")
+        self.assertNotIn(local_id, self.handler._background_submissions)
+        stale_task = fresh_task.model_copy(update={
+            "status": "submitting", "upstream_operation_id": None,
+            "project_id": None, "media_name": None, "request_log_id": None, "progress": 0,
+        })
+        snapshots = iter((stale_task, fresh_task))
+        real_get_task = self.db.get_task
+
+        async def read_snapshot(task_id):
+            try:
+                return next(snapshots)
+            except StopIteration:
+                return await real_get_task(task_id)
+
+        # 前两次读分别模拟提交前后的快照，其余操作仍使用真实 SQLite。
+        with patch.object(self.db, "get_task", side_effect=read_snapshot):
+            result = await self.handler.get_gemini_video_operation(name)
+
+        self.assertEqual(result, {"name": name, "done": False})
+        task_after = await self.db.get_task(local_id)
+        self.assertEqual(task_after.status, "processing")
+        self.assertEqual(task_after.upstream_operation_id, "op-123")
+        self.assertIsNone(task_after.error_code)
+
+    async def test_invalid_image_count_returns_400_error_code(self):
+        """验证不支持图片数量在后台路径得到 error_code=400"""
+        name = await self.handler.enqueue_gemini_video(
+            model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[b"first", b"last"],
+        )
+        await self.handler.wait_for_gemini_video_submission(name)
+
+        local_id = name.replace("operations/", "")
+        task = await self.db.get_task(local_id)
+        self.assertEqual(task.error_code, 400, "Image count validation should return 400, not 403")
+        await self._assert_failed_operation(name, 400)
+
+    async def test_missing_input_image_returns_400_and_logs_failure(self):
+        name = await self.handler.enqueue_gemini_video(model="veo_3_1_i2v_s_4s", prompt="cat", images=[])
+        await self.handler.wait_for_gemini_video_submission(name)
+        await self._assert_failed_operation(name, 400)
+
+    async def test_missing_account_returns_503_and_logs_failure(self):
+        # 只模拟后台读取不到账号；真实删除会级联删除任务，无法验证失败持久化。
+        with patch.object(self.db, "get_token", new=AsyncMock(return_value=None)):
+            name = await self.handler.enqueue_gemini_video(
+                model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+            )
+            await self.handler.wait_for_gemini_video_submission(name)
+        await self._assert_failed_operation(name, 503)
+
+    async def test_account_tier_rejection_returns_403_and_logs_failure(self):
+        name = await self.handler.enqueue_gemini_video(
+            model="veo_3_1_t2v_fast_ultra_relaxed", prompt="cat", images=[],
+        )
+        await self.handler.wait_for_gemini_video_submission(name)
+        await self._assert_failed_operation(name, 403)
+
+    async def test_failed_paths_create_request_log_with_correct_codes(self):
+        """失败路径（503/502）必须创建 request log"""
+        # 测试 503 路径
+        self.manager.ensure_valid_token = AsyncMock(return_value=None)
+        name1 = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
+        await self.handler.wait_for_gemini_video_submission(name1)
+
+        local_id1 = name1.replace("operations/", "")
+        task1 = await self.db.get_task(local_id1)
+        self.assertIsNotNone(task1.request_log_id, "503 failure must have request_log_id")
+        self.assertEqual(task1.error_code, 503)
+
+        # 测试 502 路径
+        self.flow.generate_video_text.side_effect = None  # 重置
+        self.manager.ensure_valid_token = AsyncMock(return_value=self.token)  # 恢复
+        self.flow.generate_video_text.return_value = {"operations": []}  # 无 operations
+
+        name2 = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
+        await self.handler.wait_for_gemini_video_submission(name2)
+
+        local_id2 = name2.replace("operations/", "")
+        task2 = await self.db.get_task(local_id2)
+        self.assertIsNotNone(task2.request_log_id, "502 failure must have request_log_id")
+        self.assertEqual(task2.error_code, 502)
+        await self._assert_failed_operation(name1, 503)
+        await self._assert_failed_operation(name2, 502)
+
+    async def test_submission_exceptions_persist_classified_error_and_log(self):
+        cases = (
+            (ValueError("Invalid video parameter"), 400),
+            (RuntimeError("Flow API request failed: upstream unavailable"), 502),
+            (ValueError("Flow API request failed: invalid upstream response"), 502),
+            (RuntimeError("Flow API text request failed: upstream timeout"), 502),
+            (RuntimeError("Video submission returned no operation ID"), 502),
+            (ValueError("Token not found"), 503),
+            (RuntimeError("Unexpected internal state"), 500),
+            (RuntimeError("Unexpected support registry state"), 500),
+        )
+        for error, error_code in cases:
+            with self.subTest(error=str(error), error_code=error_code):
+                self.flow.generate_video_text.side_effect = error
+                name = await self.handler.enqueue_gemini_video(
+                    model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+                )
+                await self.handler.wait_for_gemini_video_submission(name)
+                await self._assert_failed_operation(name, error_code)
 
 
 
