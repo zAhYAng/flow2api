@@ -12,8 +12,8 @@ from src.core.auth import verify_api_key_flexible
 
 class GeminiOnlyRoutesTests(unittest.TestCase):
     public_models = {
-        "Imagen 4", "Nano Banana 2", "Nano Banana Pro", "Omni 1.1 Flash",
-        "Veo 3.1 - Fast", "Veo 3.1 - Lite", "Veo 3.1 - Quality",
+        "Nano Banana Pro", "Nano Banana 2.1", "Nano Banana 2 Lite", "Imagen 4",
+        "Omni 1.1 Flash", "Veo 3.1 - Lite", "Veo 3.1 - Fast", "Veo 3.1 - Quality",
     }
 
     def setUp(self):
@@ -28,20 +28,27 @@ class GeminiOnlyRoutesTests(unittest.TestCase):
         self.client.close()
 
     def test_only_gemini_generation_routes_remain(self):
-        for path in ("/v1/chat/completions", "/v1/images/generations", "/v1/videos",
+        for path in ("/v1/images/generations", "/v1/videos",
                      "/v1/models/internal", "/v1/models/aliases"):
             with self.subTest(path=path):
                 response = self.client.post(path, json={}) if "models" not in path else self.client.get(path)
                 self.assertEqual(response.status_code, 404)
         self.assertEqual(self.client.get("/models").status_code, 200)
 
-    def test_agent_model_discovery_returns_seven_public_ids(self):
+        # /v1/chat/completions 保留，空请求返回 422，缺少 prompt 返回 400
+        empty_chat = self.client.post("/v1/chat/completions", json={})
+        self.assertEqual(empty_chat.status_code, 422)
+        missing_prompt_chat = self.client.post("/v1/chat/completions", json={"model": "Nano Banana 2.1"})
+        self.assertEqual(missing_prompt_chat.status_code, 400)
+
+    def test_agent_model_discovery_returns_eight_public_ids(self):
         response = self.client.get("/v1/models")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["object"], "list")
-        self.assertEqual(len(payload["data"]), 7)
+        self.assertEqual(len(payload["data"]), len(self.public_models))
         self.assertEqual({model["id"] for model in payload["data"]}, self.public_models)
+        self.assertNotIn("Nano Banana 2", self.public_models)
         for model in payload["data"]:
             self.assertEqual(model["object"], "model")
             self.assertEqual(model["owned_by"], "flow2api")
@@ -53,7 +60,7 @@ class GeminiOnlyRoutesTests(unittest.TestCase):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 200)
                 models = response.json()["models"]
-                self.assertEqual(len(models), 7)
+                self.assertEqual(len(models), len(self.public_models))
                 self.assertEqual({model["name"] for model in models},
                                  {f"models/{name}" for name in self.public_models})
                 veo = next(model for model in models if model["name"] == "models/Veo 3.1 - Fast")
@@ -72,7 +79,7 @@ class GeminiOnlyRoutesTests(unittest.TestCase):
                 with self.subTest(kwargs=kwargs):
                     response = self.client.get("/v1/models", **kwargs)
                     self.assertEqual(response.status_code, 200)
-                    self.assertEqual(len(response.json()["data"]), 7)
+                    self.assertEqual(len(response.json()["data"]), len(self.public_models))
 
     def test_gemini_image_returns_inline_data(self):
         async def generate(**kwargs):
@@ -87,6 +94,7 @@ class GeminiOnlyRoutesTests(unittest.TestCase):
 
         routes.retrieve_image_data = load_image
         try:
+            # 兼容验证：旧名称 Nano Banana 2 仍可正常调用
             response = self.client.post("/models/Nano Banana 2:generateContent", json={
                 "contents": [{"role": "user", "parts": [{"text": "a red apple"}]}],
                 "generationConfig": {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "1:1"}},
