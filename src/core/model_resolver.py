@@ -1186,7 +1186,7 @@ def get_friendly_model_aliases() -> Dict[str, str]:
     """Return the compact public model list that client apps should display."""
     aliases: Dict[str, str] = {}
 
-    for alias in ("Nano Banana Pro", "Nano Banana 2.1", "Nano Banana 2 Lite", "Nano Banana 2", "Imagen 4"):
+    for alias in ("Nano Banana Pro", "Nano Banana 2.1", "Nano Banana 2 Lite", "Imagen 4"):
         base = IMAGE_BASE_MODELS[alias]
         aspects = MODEL_SUPPORTED_ASPECTS.get(base, [])
         sizes = MODEL_SUPPORTED_SIZES.get(base, [])
