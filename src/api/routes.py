@@ -1119,23 +1119,15 @@ async def predict_video_long_running(
     if not images and model_config.get("video_type") not in {"t2v", "omni"}:
         return JSONResponse(status_code=400, content=_build_gemini_error_payload(400, "Model requires an input image"))
 
-    async def process_predict_video():
-        try:
-            name = await _ensure_generation_handler().submit_gemini_video(model=resolved, prompt=prompt, images=images)
-            return {"name": name, "done": False}
-        except ValueError as exc:
-            return _build_gemini_error_payload(503, str(exc))
-        except Exception as exc:
-            logging.getLogger(__name__).exception("[GEMINI VIDEO] Submission failed")
-            reason = " ".join(str(exc).split())[:500] or type(exc).__name__
-            if "MODEL_ACCESS_DENIED" in reason:
-                return _build_gemini_error_payload(
-                    403,
-                    "Selected Flow account cannot access this video model; choose an available model or account",
-                )
-            return _build_gemini_error_payload(502, f"Video submission failed: {reason}")
-
-    return StreamingResponse(_whitespace_keep_alive(process_predict_video()), media_type="application/json")
+    try:
+        name = await _ensure_generation_handler().enqueue_gemini_video(model=resolved, prompt=prompt, images=images)
+        return {"name": name, "done": False}
+    except ValueError as exc:
+        return JSONResponse(status_code=503, content=_build_gemini_error_payload(503, str(exc)))
+    except Exception as exc:
+        logging.getLogger(__name__).exception("[GEMINI VIDEO] Enqueue failed")
+        reason = " ".join(str(exc).split())[:500] or type(exc).__name__
+        return JSONResponse(status_code=500, content=_build_gemini_error_payload(500, f"Video enqueue failed: {reason}"))
 
 
 @router.get("/v1beta/operations/{operation_id}")
@@ -1208,28 +1200,33 @@ async def create_chat_completion(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-async def _whitespace_keep_alive(task_coro: Coroutine) -> AsyncGenerator[bytes, None]:
+async def _stream_json_with_keep_alive(task_coro: Coroutine) -> AsyncGenerator[bytes, None]:
     """Runs a task while emitting spaces every 3 seconds to prevent gateway timeouts."""
     task = asyncio.create_task(task_coro)
-    while not task.done():
-        yield b" "
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
-        except asyncio.TimeoutError:
-            pass
-    
     try:
-        result = task.result()
-        if isinstance(result, bytes):
-            yield result
-        elif isinstance(result, str):
-            yield result.encode("utf-8")
-        elif isinstance(result, dict):
-            yield json.dumps(result, ensure_ascii=False).encode("utf-8")
-    except HTTPException as exc:
-        yield json.dumps(_build_gemini_error_payload(exc.status_code, str(exc.detail))).encode("utf-8")
-    except Exception as exc:
-        yield json.dumps(_build_gemini_error_payload(500, str(exc))).encode("utf-8")
+        while not task.done():
+            yield b" "
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+            except asyncio.TimeoutError:
+                pass
+
+        try:
+            result = task.result()
+            if isinstance(result, bytes):
+                yield result
+            elif isinstance(result, str):
+                yield result.encode("utf-8")
+            elif isinstance(result, dict):
+                yield json.dumps(result, ensure_ascii=False).encode("utf-8")
+        except HTTPException as exc:
+            yield json.dumps(_build_gemini_error_payload(exc.status_code, str(exc.detail))).encode("utf-8")
+        except Exception as exc:
+            yield json.dumps(_build_gemini_error_payload(500, str(exc))).encode("utf-8")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @router.post("/v1beta/models/{model}:generateContent")
@@ -1268,7 +1265,7 @@ async def generate_content(
             return await _build_gemini_success_payload(payload, normalized.model)
 
         return StreamingResponse(
-            _whitespace_keep_alive(process_generate_content()),
+            _stream_json_with_keep_alive(process_generate_content()),
             media_type="application/json"
         )
 

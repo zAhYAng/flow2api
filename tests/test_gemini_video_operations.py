@@ -33,14 +33,16 @@ class GeminiVideoApiTests(unittest.TestCase):
         self.client.close()
 
     def test_submit_returns_pollable_operation_without_waiting(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/local-123"))
         response = self.client.post("/v1beta/models/Veo%203.1%20-%20Fast:predictLongRunning", json={
             "instances": [{"prompt": "a cat runs"}],
             "parameters": {"aspectRatio": "16:9"},
         })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
-        call = routes.generation_handler.submit_gemini_video.await_args.kwargs
+        self.assertEqual(response.json(), {"name": "operations/local-123", "done": False})
+        self.assertEqual(response.content, b'{"name":"operations/local-123","done":false}')
+        self.assertEqual(response.headers["content-type"], "application/json")
+        call = routes.generation_handler.enqueue_gemini_video.await_args.kwargs
         self.assertEqual(call["model"], "veo_3_1_t2v_fast_landscape")
         self.assertEqual(call["prompt"], "a cat runs")
 
@@ -58,14 +60,15 @@ class GeminiVideoApiTests(unittest.TestCase):
         }
         for (model, seconds), internal_model in expected.items():
             with self.subTest(model=model, seconds=seconds):
-                self.handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+                self.handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/op-123"))
                 routes.generation_handler = self.handler
                 response = self.client.post(f"/v1beta/models/{model}:predictLongRunning", json={
                     "instances": [{"prompt": "a cat runs"}],
                     "parameters": {"aspectRatio": "16:9", "durationSeconds": seconds},
                 })
                 self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual(self.handler.submit_gemini_video.await_args.kwargs["model"], internal_model)
+                self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
+                self.assertEqual(self.handler.enqueue_gemini_video.await_args.kwargs["model"], internal_model)
 
     def test_poll_returns_gemini_video_response(self):
         routes.generation_handler = SimpleNamespace(get_gemini_video_operation=AsyncMock(return_value={
@@ -109,19 +112,20 @@ class GeminiVideoApiTests(unittest.TestCase):
                          "http://testserver/tmp/video.mp4")
 
     def test_image_submission_routes_to_first_frame_generation(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/op-123"))
         response = self.client.post("/v1beta/models/Veo%203.1%20-%20Fast:predictLongRunning", json={
             "instances": [{"prompt": "animate", "image": {
                 "bytesBase64Encoded": base64.b64encode(b"image").decode(), "mimeType": "image/png",
             }}],
         })
         self.assertEqual(response.status_code, 200)
-        kwargs = routes.generation_handler.submit_gemini_video.await_args.kwargs
+        self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
+        kwargs = routes.generation_handler.enqueue_gemini_video.await_args.kwargs
         self.assertEqual(kwargs["images"], [b"image"])
         self.assertEqual(kwargs["model"], "veo_3_1_i2v_s_fast_fl")
 
     def test_agent_nested_inline_data_image_is_accepted(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/op-123"))
         image = base64.b64encode(b"agent-image").decode()
         response = self.client.post("/v1beta/models/Veo%203.1%20-%20Quality:predictLongRunning", json={
             "instances": [{"prompt": "animate", "image": {
@@ -130,12 +134,13 @@ class GeminiVideoApiTests(unittest.TestCase):
             "parameters": {"durationSeconds": 4, "aspectRatio": "16:9"},
         })
         self.assertEqual(response.status_code, 200, response.text)
-        kwargs = routes.generation_handler.submit_gemini_video.await_args.kwargs
+        self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
+        kwargs = routes.generation_handler.enqueue_gemini_video.await_args.kwargs
         self.assertEqual(kwargs["images"], [b"agent-image"])
         self.assertEqual(kwargs["model"], "veo_3_1_i2v_s_4s")
 
     def test_agent_first_and_last_frames_are_both_submitted(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/op-123"))
         response = self.client.post("/v1beta/models/Veo%203.1%20-%20Quality:predictLongRunning", json={
             "instances": [{
                 "prompt": "transition between frames",
@@ -149,12 +154,13 @@ class GeminiVideoApiTests(unittest.TestCase):
             "parameters": {"durationSeconds": 4, "aspectRatio": "16:9"},
         })
         self.assertEqual(response.status_code, 200, response.text)
-        kwargs = routes.generation_handler.submit_gemini_video.await_args.kwargs
+        self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
+        kwargs = routes.generation_handler.enqueue_gemini_video.await_args.kwargs
         self.assertEqual(kwargs["images"], [b"first-frame", b"last-frame"])
         self.assertEqual(kwargs["model"], "veo_3_1_i2v_s_4s")
 
     def test_agent_file_uri_image_is_downloaded_and_accepted(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/op-123"))
         with patch("src.api.routes._load_image_bytes_from_uri", new=AsyncMock(return_value=b"remote-image")) as loader:
             response = self.client.post("/v1beta/models/Veo%203.1%20-%20Fast:predictLongRunning", json={
                 "instances": [{"prompt": "animate", "image": {
@@ -163,9 +169,10 @@ class GeminiVideoApiTests(unittest.TestCase):
                 "parameters": {"durationSeconds": 6},
             })
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
         loader.assert_awaited_once_with("https://example.test/frame.png")
-        self.assertEqual(routes.generation_handler.submit_gemini_video.await_args.kwargs["images"], [b"remote-image"])
-        self.assertEqual(routes.generation_handler.submit_gemini_video.await_args.kwargs["model"],
+        self.assertEqual(routes.generation_handler.enqueue_gemini_video.await_args.kwargs["images"], [b"remote-image"])
+        self.assertEqual(routes.generation_handler.enqueue_gemini_video.await_args.kwargs["model"],
                          "veo_3_1_i2v_s_fast_6s_fl")
 
     def test_unknown_operation_returns_gemini_not_found(self):
@@ -185,49 +192,91 @@ class GeminiVideoApiTests(unittest.TestCase):
         self.assertNotIn("predictLongRunning", model["supportedGenerationMethods"])
 
     def test_standard_google_veo_name_submits(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock(return_value="operations/op-123"))
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock(return_value="operations/op-123"))
         response = self.client.post("/v1beta/models/veo-3.1-fast-generate-preview:predictLongRunning", json={
             "instances": [{"prompt": "a cat runs"}],
         })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(routes.generation_handler.submit_gemini_video.await_args.kwargs["model"],
+        self.assertEqual(response.json(), {"name": "operations/op-123", "done": False})
+        self.assertEqual(routes.generation_handler.enqueue_gemini_video.await_args.kwargs["model"],
                          "veo_3_1_t2v_fast_landscape")
 
-    def test_submission_failure_keeps_upstream_exception_in_service_log(self):
+    def test_background_submission_failure_is_reported_by_polling(self):
+        failed_operation = {
+            "name": "operations/local-123", "done": True,
+            "error": {"code": 502, "message": "upstream model rejected image"},
+        }
         routes.generation_handler = SimpleNamespace(
-            submit_gemini_video=AsyncMock(side_effect=RuntimeError("upstream model rejected image")),
-        )
-        with self.assertLogs("src.api.routes", level="ERROR") as captured:
-            response = self.client.post("/v1beta/models/Veo%203.1%20-%20Quality:predictLongRunning", json={
-                "instances": [{"prompt": "animate"}],
-            })
-
-        self.assertEqual(response.status_code, 502)
-        self.assertTrue(any("upstream model rejected image" in line for line in captured.output))
-        self.assertIn("upstream model rejected image", response.json()["error"]["message"])
-
-    def test_model_access_denied_is_reported_as_permission_error(self):
-        routes.generation_handler = SimpleNamespace(
-            submit_gemini_video=AsyncMock(side_effect=RuntimeError(
-                "Flow API request failed: PUBLIC_ERROR_MODEL_ACCESS_DENIED: The caller does not have permission"
-            )),
+            enqueue_gemini_video=AsyncMock(return_value="operations/local-123"),
+            get_gemini_video_operation=AsyncMock(return_value=failed_operation),
         )
         response = self.client.post("/v1beta/models/Veo%203.1%20-%20Quality:predictLongRunning", json={
             "instances": [{"prompt": "animate"}],
         })
-        self.assertEqual(response.status_code, 403)
-        self.assertIn("Selected Flow account cannot access this video model", response.json()["error"]["message"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"name": "operations/local-123", "done": False})
+
+        polled = self.client.get(f"/v1beta/{response.json()['name']}")
+        self.assertEqual(polled.status_code, 200)
+        self.assertEqual(polled.json(), failed_operation)
+        routes.generation_handler.get_gemini_video_operation.assert_awaited_once_with("operations/local-123")
+
+    def test_model_access_denied_is_reported_by_polling(self):
+        failed_operation = {
+            "name": "operations/local-123", "done": True,
+            "error": {"code": 403, "message": "Selected Flow account cannot access this video model"},
+        }
+        routes.generation_handler = SimpleNamespace(
+            enqueue_gemini_video=AsyncMock(return_value="operations/local-123"),
+            get_gemini_video_operation=AsyncMock(return_value=failed_operation),
+        )
+        response = self.client.post("/v1beta/models/Veo%203.1%20-%20Quality:predictLongRunning", json={
+            "instances": [{"prompt": "animate"}],
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"name": "operations/local-123", "done": False})
+
+        polled = self.client.get(f"/v1beta/{response.json()['name']}")
+        self.assertEqual(polled.status_code, 200)
+        self.assertEqual(polled.json(), failed_operation)
+        routes.generation_handler.get_gemini_video_operation.assert_awaited_once_with("operations/local-123")
+
+    def test_enqueue_without_available_account_returns_service_unavailable(self):
+        routes.generation_handler = SimpleNamespace(
+            enqueue_gemini_video=AsyncMock(side_effect=ValueError("No available video token")),
+        )
+        response = self.client.post("/v1beta/models/Veo%203.1%20-%20Fast:predictLongRunning", json={
+            "instances": [{"prompt": "animate"}],
+        })
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"error": {
+            "code": 503, "message": "No available video token", "status": "UNAVAILABLE",
+        }})
+
+    def test_enqueue_failure_returns_internal_error_and_logs_exception(self):
+        routes.generation_handler = SimpleNamespace(
+            enqueue_gemini_video=AsyncMock(side_effect=RuntimeError("local operation persistence failed")),
+        )
+        with self.assertLogs("src.api.routes", level="ERROR") as captured:
+            response = self.client.post("/v1beta/models/Veo%203.1%20-%20Fast:predictLongRunning", json={
+                "instances": [{"prompt": "animate"}],
+            })
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"error": {
+            "code": 500, "message": "Video enqueue failed: local operation persistence failed", "status": "INTERNAL",
+        }})
+        self.assertTrue(any("RuntimeError: local operation persistence failed" in line for line in captured.output))
 
     def test_explicit_model_rejects_conflicting_aspect_ratio(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock())
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock())
         response = self.client.post("/v1beta/models/veo_3_1_t2v_fast_landscape:predictLongRunning", json={
             "instances": [{"prompt": "a cat runs"}], "parameters": {"aspectRatio": "9:16"},
         })
         self.assertEqual(response.status_code, 400)
-        routes.generation_handler.submit_gemini_video.assert_not_awaited()
+        routes.generation_handler.enqueue_gemini_video.assert_not_awaited()
 
     def test_invalid_models_or_inputs_do_not_submit(self):
-        routes.generation_handler = SimpleNamespace(submit_gemini_video=AsyncMock())
+        routes.generation_handler = SimpleNamespace(enqueue_gemini_video=AsyncMock())
         for model, body in (
             ("Nano Banana 2", {"instances": [{"prompt": "cat"}]}),
             ("Veo 3.1 - Fast", {"instances": [{"prompt": " "}]}),
@@ -238,7 +287,7 @@ class GeminiVideoApiTests(unittest.TestCase):
             with self.subTest(model=model, body=body):
                 response = self.client.post(f"/v1beta/models/{model}:predictLongRunning", json=body)
                 self.assertEqual(response.status_code, 400)
-        routes.generation_handler.submit_gemini_video.assert_not_awaited()
+        routes.generation_handler.enqueue_gemini_video.assert_not_awaited()
 
     def test_polling_requires_api_key(self):
         self.client.app.dependency_overrides.clear()
@@ -246,6 +295,85 @@ class GeminiVideoApiTests(unittest.TestCase):
         self.assertIn(self.client.post("/v1beta/models/Veo%203.1%20-%20Fast:predictLongRunning", json={
             "instances": [{"prompt": "cat"}],
         }).status_code, (401, 403))
+
+
+class GeminiJsonKeepAliveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closing_stream_cancels_and_awaits_pending_generation(self):
+        started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+        generation_task = None
+
+        async def generate():
+            nonlocal generation_task
+            generation_task = asyncio.current_task()
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0)
+                cleaned_up.set()
+
+        stream = routes._stream_json_with_keep_alive(generate())
+        try:
+            self.assertEqual(await anext(stream), b" ")
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            await stream.aclose()
+            self.assertTrue(cleaned_up.is_set(), "Stream close must await generation cleanup")
+            self.assertTrue(generation_task.cancelled())
+        finally:
+            if generation_task is not None:
+                generation_task.cancel()
+                await asyncio.gather(generation_task, return_exceptions=True)
+            await stream.aclose()
+
+    async def test_cancelling_stream_cancels_and_awaits_pending_generation(self):
+        started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+        generation_task = None
+        next_chunk = None
+
+        async def generate():
+            nonlocal generation_task
+            generation_task = asyncio.current_task()
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0)
+                cleaned_up.set()
+
+        stream = routes._stream_json_with_keep_alive(generate())
+        try:
+            self.assertEqual(await anext(stream), b" ")
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            next_chunk = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            next_chunk.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await next_chunk
+            self.assertTrue(cleaned_up.is_set(), "Stream cancellation must await generation cleanup")
+            self.assertTrue(generation_task.cancelled())
+        finally:
+            if next_chunk is not None:
+                next_chunk.cancel()
+                await asyncio.gather(next_chunk, return_exceptions=True)
+            if generation_task is not None:
+                generation_task.cancel()
+                await asyncio.gather(generation_task, return_exceptions=True)
+            await stream.aclose()
+
+    async def test_completed_generation_preserves_response_serialization(self):
+        for result, expected in (
+            (b'{"done":true}', b'{"done":true}'),
+            ('{"text":"猫"}', '{"text":"猫"}'.encode("utf-8")),
+            ({"text": "猫"}, '{"text": "猫"}'.encode("utf-8")),
+        ):
+            with self.subTest(result=result):
+                async def generate():
+                    return result
+
+                chunks = [chunk async for chunk in routes._stream_json_with_keep_alive(generate())]
+                self.assertEqual(chunks, [b" ", expected])
 
 
 class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
