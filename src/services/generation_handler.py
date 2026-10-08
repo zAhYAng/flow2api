@@ -1309,35 +1309,37 @@ class GenerationHandler:
         # 选择账号
         token = await self.load_balancer.select_token(
             for_video_generation=True, model=model, reserve=False,
-            enforce_concurrency_filter=False, track_pending=False,  # 后台再 track
+            enforce_concurrency_filter=False, track_pending=True,
         )
         if not token:
             raise ValueError("No available video token")
-        
-        # 生成本地 UUID
-        local_id = str(uuid.uuid4())
-        
-        # 持久化 submitting 状态任务
-        model_config = MODEL_CONFIG[model]
-        model_key, _ = self._resolve_video_model_key_for_tier(
-            model_config, normalize_user_paygate_tier(token.user_paygate_tier),
-        )
-        
-        await self.db.create_task(Task(
-            task_id=local_id,
-            token_id=token.id,
-            model=model_key,
-            prompt=prompt,
-            status="submitting",
-            progress=0,
-        ))
-        
-        # 创建后台任务
-        task = asyncio.create_task(
-            self._submit_gemini_video_operation(local_id, token.id, model, prompt, images)
-        )
+
+        # 后台 task 创建成功前由 enqueue 持有 pending；失败或取消时原样抛出并回滚。
+        try:
+            local_id = str(uuid.uuid4())
+            model_config = MODEL_CONFIG[model]
+            model_key, _ = self._resolve_video_model_key_for_tier(
+                model_config, normalize_user_paygate_tier(token.user_paygate_tier),
+            )
+            await self.db.create_task(Task(
+                task_id=local_id,
+                token_id=token.id,
+                model=model_key,
+                prompt=prompt,
+                status="submitting",
+                progress=0,
+            ))
+            submission = self._submit_gemini_video_operation(local_id, token.id, model, prompt, images)
+            try:
+                task = asyncio.create_task(submission)
+            except BaseException:
+                submission.close()
+                raise
+        except BaseException:
+            await self.load_balancer.release_pending(token.id, for_video_generation=True)
+            raise
+
         self._background_submissions[local_id] = task
-        
         return f"operations/{local_id}"
 
     async def _submit_gemini_video_operation(
@@ -1346,12 +1348,8 @@ class GenerationHandler:
         """后台提交 Flow 视频生成请求"""
         upstream_operation_id = None
         try:
-            model_config = MODEL_CONFIG[model]
-            
-            # Track pending
-            await self.load_balancer.track_pending(token_id, for_video_generation=True)
-            
             try:
+                model_config = MODEL_CONFIG[model]
                 token = await self.db.get_token(token_id)
                 if not token:
                     raise ValueError("Video account is no longer available")
@@ -1492,6 +1490,7 @@ class GenerationHandler:
         if any(marker in message for marker in (
             "video submission returned no operation",
             "flow api request failed", "flow api text request failed",
+            "flow video api request timed out after ",
         )):
             return 502
         return 400 if isinstance(error, ValueError) else 500

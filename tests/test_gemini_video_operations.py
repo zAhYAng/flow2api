@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import tempfile
 import sqlite3
@@ -16,6 +17,7 @@ from src.core.auth import verify_api_key_flexible
 from src.core.database import Database
 from src.core.models import Task, Token
 from src.services.generation_handler import GenerationHandler
+from src.services.load_balancer import LoadBalancer
 
 
 class GeminiVideoApiTests(unittest.TestCase):
@@ -273,11 +275,20 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
             get_media_url_redirect=AsyncMock(return_value="https://example.test/video.mp4"),
         )
         self.manager = SimpleNamespace(
+            get_active_tokens=AsyncMock(return_value=[token]),
+            needs_at_refresh=lambda token: False,
             ensure_valid_token=AsyncMock(return_value=token),
             ensure_project_exists=AsyncMock(return_value="project-1"),
             record_usage=AsyncMock(), record_success=AsyncMock(),
         )
-        self.balancer = SimpleNamespace(select_token=AsyncMock(return_value=token), release_pending=AsyncMock(), track_pending=AsyncMock())
+        balancer_config = patch("src.services.load_balancer.config", SimpleNamespace(
+            captcha_method="yescaptcha", call_logic_mode="default",
+        ))
+        balancer_config.start()
+        self.addCleanup(balancer_config.stop)
+        self.balancer = LoadBalancer(self.manager)
+        # 保留真实计数副作用，同时检测重复释放（真实计数会将负数截断为零）。
+        self.balancer.release_pending = AsyncMock(wraps=self.balancer.release_pending)
         self.handler = GenerationHandler(self.flow, self.manager, self.balancer, self.db, None, None)
 
     async def asyncTearDown(self):
@@ -307,6 +318,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.get("name"), name)
         self.assertEqual(response["status"], "failed")
         self.assertEqual(response["error"], error)
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
 
     async def test_operation_survives_new_handler_and_polls_upstream(self):
         name = await self.handler.submit_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="a cat", images=[])
@@ -407,6 +419,120 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tier", task.error_message.lower())
         await self._assert_failed_operation(name, 403)
 
+    async def test_real_load_balancer_tracks_pending_until_background_completes(self):
+        release_submission = asyncio.Event()
+        pending_at_persistence = []
+        real_create_task = self.db.create_task
+
+        async def create_task(task):
+            pending_at_persistence.append(
+                await self.balancer._get_pending_count(self.token.id, False, True)
+            )
+            return await real_create_task(task)
+
+        async def hold_submission(**kwargs):
+            await release_submission.wait()
+
+        self.flow.prefill_remote_browser_pool.side_effect = hold_submission
+        with patch.object(self.db, "create_task", side_effect=create_task):
+            name = await self.handler.enqueue_gemini_video(
+                model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+            )
+        local_id = name.removeprefix("operations/")
+        background_task = self.handler._background_submissions[local_id]
+        try:
+            self.assertEqual(pending_at_persistence, [1])
+            self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 1)
+            self.assertEqual(await self.handler.get_gemini_video_operation(name), {"name": name, "done": False})
+            self.assertEqual((await self.db.get_task(local_id)).status, "submitting")
+        finally:
+            release_submission.set()
+            await asyncio.wait_for(background_task, timeout=2.0)
+
+        task = await self.db.get_task(local_id)
+        self.assertEqual(task.status, "processing")
+        self.assertNotEqual(local_id, "op-123")
+        self.assertEqual(task.upstream_operation_id, "op-123")
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
+        self.balancer.release_pending.assert_awaited_once_with(self.token.id, for_video_generation=True)
+
+    async def test_enqueue_rolls_back_pending_before_task_persistence(self):
+        with patch.object(self.handler, "_resolve_video_model_key_for_tier", side_effect=RuntimeError("Model resolution failed")):
+            with self.assertRaisesRegex(RuntimeError, "Model resolution failed"):
+                await self.handler.enqueue_gemini_video(
+                    model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+                )
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
+        self.balancer.release_pending.assert_awaited_once_with(self.token.id, for_video_generation=True)
+        self.assertFalse(self.handler._background_submissions)
+
+    async def test_enqueue_rolls_back_pending_if_task_persistence_fails(self):
+        error = RuntimeError("Task insert failed")
+        with patch.object(self.db, "create_task", side_effect=error):
+            with self.assertRaises(RuntimeError) as raised:
+                await self.handler.enqueue_gemini_video(
+                    model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+                )
+        self.assertIs(raised.exception, error)
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
+        self.balancer.release_pending.assert_awaited_once_with(self.token.id, for_video_generation=True)
+        self.assertFalse(self.handler._background_submissions)
+
+    async def test_enqueue_rolls_back_pending_if_background_task_creation_fails(self):
+        submissions = []
+
+        def fail_task_creation(submission):
+            submissions.append(submission)
+            raise RuntimeError("Background task creation failed")
+
+        try:
+            with patch("src.services.generation_handler.asyncio.create_task", side_effect=fail_task_creation):
+                with self.assertRaisesRegex(RuntimeError, "Background task creation failed"):
+                    await self.handler.enqueue_gemini_video(
+                        model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+                    )
+            self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
+            self.balancer.release_pending.assert_awaited_once_with(self.token.id, for_video_generation=True)
+            self.assertFalse(self.handler._background_submissions)
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(inspect.getcoroutinestate(submissions[0]), inspect.CORO_CLOSED)
+        finally:
+            for submission in submissions:
+                submission.close()
+
+    async def test_enqueue_cancellation_during_persistence_releases_pending(self):
+        persistence_started = asyncio.Event()
+        hold_persistence = asyncio.Event()
+
+        async def blocked_create_task(task):
+            persistence_started.set()
+            await hold_persistence.wait()
+
+        with patch.object(self.db, "create_task", side_effect=blocked_create_task):
+            enqueue_task = asyncio.create_task(self.handler.enqueue_gemini_video(
+                model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+            ))
+            try:
+                await asyncio.wait_for(persistence_started.wait(), timeout=2.0)
+                pending_before_cancel = await self.balancer._get_pending_count(self.token.id, False, True)
+            finally:
+                enqueue_task.cancel()
+                results = await asyncio.gather(enqueue_task, return_exceptions=True)
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.assertEqual(pending_before_cancel, 1)
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
+        self.balancer.release_pending.assert_awaited_once_with(self.token.id, for_video_generation=True)
+        self.assertFalse(self.handler._background_submissions)
+
+    async def test_enqueue_without_available_token_does_not_release_pending(self):
+        self.manager.get_active_tokens.return_value = []
+        with self.assertRaisesRegex(ValueError, "No available video token"):
+            await self.handler.enqueue_gemini_video(
+                model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+            )
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
+        self.balancer.release_pending.assert_not_awaited()
+
     async def test_enqueue_with_upstream_failure_persists_gemini_error(self):
         """后台提交遇到普通上游失败时持久化 Gemini 错误"""
         self.flow.generate_video_text.side_effect = RuntimeError("Video submission returned no operation")
@@ -453,6 +579,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.balancer.release_pending.await_count, 1)
         call_kwargs = self.balancer.release_pending.await_args.kwargs
         self.assertEqual(call_kwargs.get('for_video_generation'), True)
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
 
     async def test_release_pending_called_exactly_once_on_permission_denied(self):
         """权限拒绝路径必须恰好 release_pending 一次"""
@@ -463,6 +590,8 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         
         self.assertEqual(self.balancer.release_pending.await_count, 1)
 
+        await self._assert_failed_operation(name, 403)
+
     async def test_release_pending_called_exactly_once_on_upstream_failure(self):
         """上游失败路径必须恰好 release_pending 一次"""
         self.balancer.release_pending.reset_mock()
@@ -471,6 +600,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.wait_for_gemini_video_submission(name)
         
         self.assertEqual(self.balancer.release_pending.await_count, 1)
+        self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
 
     async def test_error_code_403_for_permission_denied(self):
         """权限/层级拒绝必须使用 error_code=403"""
@@ -489,8 +619,8 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_code_503_for_invalid_token(self):
         """无效 Token 必须使用 error_code=503"""
-        # Mock Token 无效场景
-        self.manager.ensure_valid_token = AsyncMock(return_value=None)
+        # 选择账号时有效，后台重新校验时失效。
+        self.manager.ensure_valid_token.side_effect = [self.token, None]
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name)
         
@@ -674,6 +804,9 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         await self._assert_failed_operation(name, 503)
 
     async def test_account_tier_rejection_returns_403_and_logs_failure(self):
+        ultra_token = self.token.model_copy(update={"user_paygate_tier": "PAYGATE_TIER_TWO"})
+        self.manager.get_active_tokens.return_value = [ultra_token]
+        self.manager.ensure_valid_token.side_effect = [ultra_token, self.token]
         name = await self.handler.enqueue_gemini_video(
             model="veo_3_1_t2v_fast_ultra_relaxed", prompt="cat", images=[],
         )
@@ -683,7 +816,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_paths_create_request_log_with_correct_codes(self):
         """失败路径（503/502）必须创建 request log"""
         # 测试 503 路径
-        self.manager.ensure_valid_token = AsyncMock(return_value=None)
+        self.manager.ensure_valid_token.side_effect = [self.token, None]
         name1 = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name1)
 
@@ -726,6 +859,26 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await self.handler.wait_for_gemini_video_submission(name)
                 await self._assert_failed_operation(name, error_code)
+
+    async def test_flow_video_api_timeout_returns_502_and_logs_failure(self):
+        error = Exception("Flow video API request timed out after 45s")
+        self.flow.generate_video_text.side_effect = error
+        name = await self.handler.enqueue_gemini_video(
+            model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+        )
+        await self.handler.wait_for_gemini_video_submission(name)
+        await self._assert_failed_operation(name, 502)
+        self.assertEqual((await self.db.get_task(name.removeprefix("operations/"))).error_message, str(error))
+
+    async def test_local_database_timeout_returns_500_and_logs_failure(self):
+        with patch.object(self.db, "get_token", side_effect=TimeoutError("Local database read timed out")):
+            name = await self.handler.enqueue_gemini_video(
+                model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[],
+            )
+            await self.handler.wait_for_gemini_video_submission(name)
+        await self._assert_failed_operation(name, 500)
+        task = await self.db.get_task(name.removeprefix("operations/"))
+        self.assertEqual(task.error_message, "Local database read timed out")
 
 
 
