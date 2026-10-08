@@ -9,13 +9,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from src.api import routes
 from src.core.auth import verify_api_key_flexible
 from src.core.database import Database
-from src.core.models import Task, Token
+from src.core.models import GeminiGenerateContentRequest, Task, Token
 from src.services.generation_handler import GenerationHandler
 from src.services.load_balancer import LoadBalancer
 
@@ -218,7 +220,10 @@ class GeminiVideoApiTests(unittest.TestCase):
 
         polled = self.client.get(f"/v1beta/{response.json()['name']}")
         self.assertEqual(polled.status_code, 200)
-        self.assertEqual(polled.json(), failed_operation)
+        self.assertEqual(polled.json(), {
+            "name": "operations/local-123", "done": True,
+            "error": {"code": 502, "status": "UNAVAILABLE", "message": "upstream model rejected image"},
+        })
         routes.generation_handler.get_gemini_video_operation.assert_awaited_once_with("operations/local-123")
 
     def test_model_access_denied_is_reported_by_polling(self):
@@ -238,8 +243,43 @@ class GeminiVideoApiTests(unittest.TestCase):
 
         polled = self.client.get(f"/v1beta/{response.json()['name']}")
         self.assertEqual(polled.status_code, 200)
-        self.assertEqual(polled.json(), failed_operation)
+        self.assertEqual(polled.json(), {
+            "name": "operations/local-123", "done": True,
+            "error": {
+                "code": 403, "status": "PERMISSION_DENIED",
+                "message": "Selected Flow account cannot access this video model",
+            },
+        })
         routes.generation_handler.get_gemini_video_operation.assert_awaited_once_with("operations/local-123")
+
+    def test_poll_error_adds_missing_gemini_status(self):
+        for code, status in ((503, "UNAVAILABLE"), (500, "INTERNAL")):
+            with self.subTest(code=code):
+                routes.generation_handler = SimpleNamespace(get_gemini_video_operation=AsyncMock(return_value={
+                    "name": "operations/local-123", "done": True,
+                    "error": {"code": code, "message": "video submission failed"},
+                }))
+                response = self.client.get("/v1beta/operations/local-123")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {
+                    "name": "operations/local-123", "done": True,
+                    "error": {"code": code, "status": status, "message": "video submission failed"},
+                })
+
+    def test_poll_error_preserves_handler_status_and_details(self):
+        routes.generation_handler = SimpleNamespace(get_gemini_video_operation=AsyncMock(return_value={
+            "name": "operations/local-123", "done": True,
+            "error": {
+                "code": 503, "status": "RESOURCE_EXHAUSTED", "message": "account capacity exhausted",
+                "details": [{"retryDelay": "10s"}],
+            },
+        }))
+        response = self.client.get("/v1beta/operations/local-123")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["error"], {
+            "code": 503, "status": "RESOURCE_EXHAUSTED", "message": "account capacity exhausted",
+            "details": [{"retryDelay": "10s"}],
+        })
 
     def test_enqueue_without_available_account_returns_service_unavailable(self):
         routes.generation_handler = SimpleNamespace(
@@ -374,6 +414,154 @@ class GeminiJsonKeepAliveTests(unittest.IsolatedAsyncioTestCase):
 
                 chunks = [chunk async for chunk in routes._stream_json_with_keep_alive(generate())]
                 self.assertEqual(chunks, [b" ", expected])
+
+
+class GeminiJsonKeepAliveAsgiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.scope = {
+            "type": "http", "asgi": {"spec_version": "2.3"}, "method": "POST", "scheme": "http",
+            "path": "/models/Veo 3.1 - Fast:generateContent", "query_string": b"",
+            "headers": [(b"host", b"testserver")],
+        }
+
+    async def _make_response(self):
+        response = await routes.generate_content(
+            model="Veo 3.1 - Fast",
+            request=GeminiGenerateContentRequest(contents=[{"role": "user", "parts": [{"text": "cat"}]}]),
+            raw_request=Request(self.scope), api_key="test",
+        )
+        self.assertIsInstance(response, StreamingResponse)
+        return response
+
+    async def _assert_disconnect_cleanup(self, phase):
+        started = asyncio.Event()
+        sending = asyncio.Event()
+        cleaned_up = asyncio.Event()
+        generation_task = None
+        messages = []
+        received = []
+        previous_tasks = asyncio.all_tasks()
+
+        async def generate(*args, **kwargs):
+            nonlocal generation_task
+            generation_task = asyncio.current_task()
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                # Multiple checkpoints expose repeated cancellation from the ASGI cancel scope.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                cleaned_up.set()
+
+        async def receive():
+            await started.wait()
+            if phase == "sending":
+                await sending.wait()
+            received.append({"type": "http.disconnect"})
+            return received[-1]
+
+        async def send(message):
+            messages.append(message)
+            if message["type"] == "http.response.body" and phase != "waiting":
+                await started.wait()
+                sending.set()
+                if phase == "send_error":
+                    raise OSError("client disconnected during send")
+                await asyncio.Future()
+
+        with patch("src.api.routes._collect_non_stream_result", new=generate):
+            response = await self._make_response()
+            try:
+                if phase == "send_error":
+                    self.scope["asgi"]["spec_version"] = "2.4"
+                    with self.assertRaises(ClientDisconnect):
+                        await asyncio.wait_for(response(self.scope, receive, send), timeout=2.0)
+                else:
+                    await asyncio.wait_for(response(self.scope, receive, send), timeout=2.0)
+                    self.assertEqual(received, [{"type": "http.disconnect"}])
+                self.assertEqual(messages[0]["type"], "http.response.start")
+                self.assertEqual(messages[1], {"type": "http.response.body", "body": b" ", "more_body": True})
+                self.assertEqual({
+                    "generator_closed": response.body_iterator.ag_frame is None,
+                    "generation_cancelled": generation_task.cancelled(),
+                    "cleanup_finished": cleaned_up.is_set(),
+                    "pending_tasks": len(asyncio.all_tasks() - previous_tasks),
+                }, {
+                    "generator_closed": True, "generation_cancelled": True,
+                    "cleanup_finished": True, "pending_tasks": 0,
+                })
+            finally:
+                if generation_task is not None:
+                    generation_task.cancel()
+                    await asyncio.gather(generation_task, return_exceptions=True)
+                await response.body_iterator.aclose()
+
+    async def test_asgi_disconnect_while_waiting_closes_and_drains_generation(self):
+        await self._assert_disconnect_cleanup("waiting")
+
+    async def test_asgi_disconnect_during_send_closes_and_drains_generation(self):
+        await self._assert_disconnect_cleanup("sending")
+
+    async def test_asgi_send_error_closes_and_drains_generation(self):
+        await self._assert_disconnect_cleanup("send_error")
+
+    async def test_asgi_disconnect_during_headers_closes_unstarted_generation(self):
+        sending_headers = asyncio.Event()
+        messages = []
+        previous_tasks = asyncio.all_tasks()
+
+        async def receive():
+            await sending_headers.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+            sending_headers.set()
+            await asyncio.Future()
+
+        with patch("src.api.routes._stream_json_with_keep_alive", wraps=routes._stream_json_with_keep_alive) as stream:
+            response = await self._make_response()
+        generation_coro = stream.call_args.args[0]
+        try:
+            await asyncio.wait_for(response(self.scope, receive, send), timeout=2.0)
+            self.assertEqual([message["type"] for message in messages], ["http.response.start"])
+            self.assertEqual({
+                "generator_closed": response.body_iterator.ag_frame is None,
+                "coroutine_state": inspect.getcoroutinestate(generation_coro),
+                "pending_tasks": len(asyncio.all_tasks() - previous_tasks),
+            }, {"generator_closed": True, "coroutine_state": inspect.CORO_CLOSED, "pending_tasks": 0})
+        finally:
+            await response.body_iterator.aclose()
+            generation_coro.close()
+
+    async def test_asgi_success_preserves_keep_alive_and_json_output(self):
+        messages = []
+        previous_tasks = asyncio.all_tasks()
+
+        async def receive():
+            await asyncio.Future()
+
+        async def send(message):
+            messages.append(message)
+
+        result = '{"choices":[{"message":{"content":"猫"}}]}'
+        with patch("src.api.routes._collect_non_stream_result", new=AsyncMock(return_value=result)):
+            response = await self._make_response()
+            await asyncio.wait_for(response(self.scope, receive, send), timeout=2.0)
+        self.assertEqual(messages[0]["status"], 200)
+        self.assertIn((b"content-type", b"application/json"), messages[0]["headers"])
+        self.assertEqual(messages[1], {"type": "http.response.body", "body": b" ", "more_body": True})
+        self.assertEqual(messages[-1], {"type": "http.response.body", "body": b"", "more_body": False})
+        self.assertEqual(json.loads(b"".join(message["body"] for message in messages[1:])), {
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "猫"}]},
+                "finishReason": "STOP", "index": 0,
+            }],
+            "modelVersion": "veo_3_1_t2v_fast_landscape",
+        })
+        self.assertIsNone(response.body_iterator.ag_frame)
+        self.assertEqual(asyncio.all_tasks() - previous_tasks, set())
 
 
 class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):

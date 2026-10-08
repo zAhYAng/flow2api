@@ -12,10 +12,12 @@ import re
 from urllib.parse import urlparse
 from types import SimpleNamespace
 
+from anyio import CancelScope
 from curl_cffi.requests import AsyncSession
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.types import Receive, Scope, Send
 
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
@@ -1143,6 +1145,12 @@ async def poll_video_operation(operation_id: str, raw_request: Request, model: O
         return JSONResponse(status_code=502, content=_build_gemini_error_payload(502, "Video status lookup failed"))
     if operation is None:
         return JSONResponse(status_code=404, content=_build_gemini_error_payload(404, "Video operation not found"))
+    error = operation.get("error")
+    if isinstance(error, dict) and "status" not in error:
+        operation = {
+            **operation,
+            "error": {**error, "status": GEMINI_STATUS_MAP.get(error.get("code"), "UNKNOWN")},
+        }
     if operation.get("done") and "response" in operation:
         for sample in operation.get("response", {}).get("generateVideoResponse", {}).get("generatedSamples", []):
             video = sample.get("video", {})
@@ -1226,7 +1234,25 @@ async def _stream_json_with_keep_alive(task_coro: Coroutine) -> AsyncGenerator[b
     finally:
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            with CancelScope(shield=True):
+                await asyncio.gather(task, return_exceptions=True)
+
+
+class _GeminiJsonStreamingResponse(StreamingResponse):
+    """Own the JSON iterator and generation coroutine for the full ASGI response."""
+
+    def __init__(self, generation_coro: Coroutine):
+        self._generation_coro = generation_coro
+        super().__init__(_stream_json_with_keep_alive(generation_coro), media_type="application/json")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with CancelScope(shield=True):
+                await self.body_iterator.aclose()
+                # Disconnect can occur while sending headers, before iteration starts.
+                self._generation_coro.close()
 
 
 @router.post("/v1beta/models/{model}:generateContent")
@@ -1264,10 +1290,7 @@ async def generate_content(
 
             return await _build_gemini_success_payload(payload, normalized.model)
 
-        return StreamingResponse(
-            _stream_json_with_keep_alive(process_generate_content()),
-            media_type="application/json"
-        )
+        return _GeminiJsonStreamingResponse(process_generate_content())
 
     except HTTPException as exc:
         return JSONResponse(
