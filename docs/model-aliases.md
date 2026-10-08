@@ -25,8 +25,8 @@
 | 分辨率 | 参数值 | 说明 |
 | --- | --- | --- |
 | 默认 | `1k` 或不传 | 不走放大模型 |
-| 2K | `2k` | 仅 `Nano Banana Pro`、`Nano Banana 2` 支持 |
-| 4K | `4k` | 仅 `Nano Banana Pro`、`Nano Banana 2` 支持 |
+| 2K | `2k` | 仅 `Nano Banana Pro`、`Nano Banana 2.1` 等支持 |
+| 4K | `4k` | 仅 `Nano Banana Pro`、`Nano Banana 2.1` 等支持 |
 
 ### 视频画幅
 
@@ -64,10 +64,11 @@
 | 模型名 | 对应产品 | 支持画幅 | 支持分辨率 |
 | --- | --- | --- | --- |
 | `Nano Banana Pro` | Nano Banana Pro | `16:9`、`9:16`、`1:1`、`4:3`、`3:4` | 默认、`2k`、`4k` |
-| `Nano Banana 2` | Nano Banana 2 | `16:9`、`9:16`、`1:1`、`4:3`、`3:4` | 默认、`2k`、`4k` |
+| `Nano Banana 2.1` | Nano Banana 2.1 | `16:9`、`9:16`、`1:1`、`4:3`、`3:4` | 默认、`2k`、`4k` |
+| `Nano Banana 2 Lite` | Nano Banana 2 Lite | `16:9`、`9:16`、`1:1`、`4:3`、`3:4` | 默认、`2k`、`4k` |
 | `Imagen 4` | Imagen 4 | `16:9`、`9:16` | 默认 |
 
-兼容别名：`Nano Banana 2`、`nano-banana-pro`、`nanobanana-pro`、`nano-banana-2`、`nano-banana2`、`nanobanana2`、`imagen`。
+兼容别名：`Nano Banana 2`、`nano-banana-pro`、`nano-banana-2.1`、`nano-banana-2-lite`、`nano-banana-lite`、`imagen` 等。旧版 `Nano Banana 2` 的调用将自动路由至 `Nano Banana 2.1`。
 
 ## 视频模型名
 
@@ -92,14 +93,14 @@
 
 这意味着画布/工作流应用不需要显式切换到 `veo-i2v-*` 或 `veo-r2v-*` 这类内部模型，只要把图片放入 Gemini `contents[].parts[].inlineData` 并使用上述公开模型名即可。
 
-兼容别名：`veo`、`veo-fast`、`veo-lite`、`veo-i2v`、`veo-i2v-fast`、`veo-r2v` 等上一版短名仍然可调用，但默认模型列表不展示。
+兼容别名：`veo`、`veo-fast`、`veo-lite`、`veo-ultra`、`veo-relaxed`、`veo-i2v`、`veo-i2v-fast`、`veo-r2v` 等上一版短名仍然可调用，但默认模型列表不展示。
 
 ## Gemini 官方格式示例
 
-### Nano Banana 2 生成图片
+### Nano Banana 2.1 生成图片
 
 ```bash
-curl -X POST "http://localhost:8000/models/Nano%20Banana2:generateContent" \
+curl -X POST "http://localhost:8000/models/Nano%20Banana%202.1:generateContent" \
   -H "x-goog-api-key: $FLOW2API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -143,7 +144,8 @@ curl -X POST "http://localhost:8000/models/Veo%203.1%20-%20Lite:generateContent"
 | 请求模型 | 参数 | 内部实际模型 |
 | --- | --- | --- |
 | `Nano Banana Pro` | `aspectRatio=3:4`、`imageSize=4k` | `gemini-3.0-pro-image-three-four-4k` |
-| `Nano Banana 2` | `aspectRatio=1:1`、`imageSize=2k` | `gemini-3.1-flash-image-square-2k` |
+| `Nano Banana 2.1` | `aspectRatio=1:1`、`imageSize=2k` | `gemini-3.1-flash-image-square-2k` |
+| `Nano Banana 2 Lite` | `aspectRatio=16:9`、`imageSize=2k` | `gemini-3.1-flash-lite-image-landscape-2k` |
 | `Omni 1.1 Flash` | `aspectRatio=16:9`、`durationSeconds=6`、0 张图 | `omni_6s` (`abra_t2v_6s`) |
 | `Omni 1.1 Flash` | `aspectRatio=16:9`、`durationSeconds=6`、1 张图 | `omni_6s` (`abra_i2v_6s`, 首帧) |
 | `Omni 1.1 Flash` | `aspectRatio=16:9`、`durationSeconds=6`、2 张图 | `omni_6s` (`abra_i2v_6s`, 首尾帧) |
