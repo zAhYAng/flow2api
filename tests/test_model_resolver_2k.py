@@ -105,6 +105,22 @@ class ModelResolver2KTests(unittest.TestCase):
         self.assertEqual(resolve_model_name("gemini-3.0-pro-image-portrait", None, MODEL_CONFIG), "gemini-3.0-pro-image-portrait")
         self.assertEqual(resolve_model_name("gemini-3.0-pro-image", None, MODEL_CONFIG), "gemini-3.0-pro-image-landscape")
 
+    def test_openai_pixel_size_does_not_override_quality(self):
+        request = SimpleNamespace(__pydantic_extra__={"size": "1024x1024", "quality": "high"})
+        self.assertEqual(
+            resolve_model_name("nano-banana-2", request, MODEL_CONFIG),
+            "gemini-3.1-flash-image-square-4k",
+        )
+
+    def test_explicit_image_size_wins_over_quality(self):
+        request = SimpleNamespace(
+            generationConfig={"imageSize": "2k", "size": "1024x1024", "quality": "high"}
+        )
+        self.assertEqual(
+            resolve_model_name("Nano Banana 2.1", request, MODEL_CONFIG),
+            "gemini-3.1-flash-image-square-2k",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

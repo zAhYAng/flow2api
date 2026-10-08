@@ -777,27 +777,34 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
             return mapped
         return _normalize_image_size(token)
 
+    def _tier_image_size(value: Any) -> Optional[str]:
+        raw = _normalize_str(value)
+        if not raw:
+            return None
+        token = raw.replace(" ", "").lower()
+        if token in ("1k", "2k", "4k", "1080p"):
+            return token
+        return None
+
     def _apply_image_config(image_config: Any, aspect_ratio: Optional[str], image_size: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
         if not aspect_ratio:
             aspect_ratio = _normalize_aspect_ratio(
                 _read_value(image_config, "aspectRatio", "aspect_ratio", "aspect")
             )
+        size_val = _read_value(image_config, "size")
+        if not aspect_ratio and size_val:
+            aspect_ratio = _aspect_from_openai_size(size_val)
+
         if not image_size:
             image_size = _normalize_image_size(
                 _read_value(image_config, "imageSize", "image_size", "resolution")
             )
-
-        # 检查 size 字段（可能包含 2k/4k，或 1024x1792）
-        size_val = _read_value(image_config, "size")
-        if not aspect_ratio and size_val:
-            aspect_ratio = _aspect_from_openai_size(size_val)
-        if not image_size and size_val:
-            image_size = _normalize_image_size(size_val)
-
         if not image_size:
             image_size = _image_size_from_openai_quality(
                 _read_value(image_config, "quality", "imageQuality", "image_quality")
             )
+        if not image_size and size_val:
+            image_size = _tier_image_size(size_val)
 
         return aspect_ratio, image_size
 
@@ -823,23 +830,25 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
             aspect_ratio = _normalize_aspect_ratio(
                 _read_value(gen_config, "aspectRatio", "aspect_ratio")
             )
+        size_val = _read_value(gen_config, "size")
+        if not aspect_ratio and size_val:
+            aspect_ratio = _aspect_from_openai_size(size_val)
+
         if not image_size:
             image_size = _normalize_image_size(
                 _read_value(gen_config, "imageSize", "image_size", "resolution")
             )
+        if not image_size:
+            image_size = _image_size_from_openai_quality(
+                _read_value(gen_config, "quality", "imageQuality", "image_quality")
+            )
+        if not image_size and size_val:
+            image_size = _tier_image_size(size_val)
+
         if duration_seconds is None:
             duration_seconds = _normalize_duration(
                 _read_value(gen_config, "durationSeconds", "duration_seconds", "duration")
             )
-
-        size_val = _read_value(gen_config, "size")
-        if not aspect_ratio and size_val:
-            aspect_ratio = _aspect_from_openai_size(size_val)
-        if not image_size and size_val:
-            image_size = _normalize_image_size(size_val)
-
-        if not image_size:
-            image_size = _image_size_from_openai_quality(_read_value(gen_config, "quality"))
 
     # 2) 顶层 imageConfig / image_config 兼容
     top_image_config = getattr(request, "imageConfig", None) or getattr(request, "image_config", None)
@@ -870,28 +879,35 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
                     aspect_ratio = _normalize_aspect_ratio(
                         extra_gen_config.get("aspectRatio") or extra_gen_config.get("aspect_ratio")
                     )
+                if aspect_ratio is None and extra_gen_config.get("size"):
+                    aspect_ratio = _aspect_from_openai_size(extra_gen_config.get("size"))
+
                 if image_size is None:
                     image_size = _normalize_image_size(
                         extra_gen_config.get("imageSize") or extra_gen_config.get("image_size") or extra_gen_config.get("resolution")
                     )
+                if image_size is None:
+                    image_size = _image_size_from_openai_quality(
+                        extra_gen_config.get("quality")
+                        or extra_gen_config.get("imageQuality")
+                        or extra_gen_config.get("image_quality")
+                    )
+                if image_size is None and extra_gen_config.get("size"):
+                    image_size = _tier_image_size(extra_gen_config.get("size"))
+
                 if duration_seconds is None:
                     duration_seconds = _normalize_duration(
                         extra_gen_config.get("durationSeconds")
                         or extra_gen_config.get("duration_seconds")
                         or extra_gen_config.get("duration")
                     )
-                if aspect_ratio is None:
-                    aspect_ratio = _aspect_from_openai_size(extra_gen_config.get("size"))
-                if image_size is None and extra_gen_config.get("size"):
-                    image_size = _normalize_image_size(extra_gen_config.get("size"))
-                if image_size is None:
-                    image_size = _image_size_from_openai_quality(extra_gen_config.get("quality"))
 
     # 4) 顶层直接字段 (OpenAI 或其它客户端直传)
     if (aspect_ratio is None or image_size is None or duration_seconds is None):
         target_dict = request.__pydantic_extra__ if hasattr(request, "__pydantic_extra__") and request.__pydantic_extra__ else {}
-        if aspect_ratio is None:
-            aspect_ratio = _aspect_from_openai_size(target_dict.get("size") or getattr(request, "size", None))
+        size_val = target_dict.get("size") or getattr(request, "size", None)
+        if aspect_ratio is None and size_val:
+            aspect_ratio = _aspect_from_openai_size(size_val)
         if aspect_ratio is None:
             aspect_ratio = _normalize_aspect_ratio(
                 target_dict.get("aspect_ratio") or target_dict.get("aspectRatio") or getattr(request, "aspectRatio", None) or getattr(request, "aspect_ratio", None)
@@ -901,11 +917,14 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
                 target_dict.get("image_size") or target_dict.get("imageSize") or target_dict.get("resolution") or getattr(request, "imageSize", None) or getattr(request, "image_size", None)
             )
         if image_size is None:
-            size_val = target_dict.get("size") or getattr(request, "size", None)
-            if size_val:
-                image_size = _normalize_image_size(size_val)
-        if image_size is None:
-            image_size = _image_size_from_openai_quality(target_dict.get("quality") or getattr(request, "quality", None))
+            image_size = _image_size_from_openai_quality(
+                target_dict.get("quality")
+                or target_dict.get("imageQuality")
+                or target_dict.get("image_quality")
+                or getattr(request, "quality", None)
+            )
+        if image_size is None and size_val:
+            image_size = _tier_image_size(size_val)
         if duration_seconds is None:
             duration_seconds = _normalize_duration(
                 target_dict.get("durationSeconds") or target_dict.get("duration_seconds") or target_dict.get("duration") or getattr(request, "durationSeconds", None) or getattr(request, "duration", None)
@@ -914,16 +933,18 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
     # 5) raw_request query params 兼容
     if raw_request is not None and hasattr(raw_request, "query_params"):
         qp = raw_request.query_params
-        if aspect_ratio is None:
-            aspect_ratio = _normalize_aspect_ratio(qp.get("aspectRatio") or qp.get("aspect_ratio"))
         if aspect_ratio is None and qp.get("size"):
             aspect_ratio = _aspect_from_openai_size(qp.get("size"))
+        if aspect_ratio is None:
+            aspect_ratio = _normalize_aspect_ratio(qp.get("aspectRatio") or qp.get("aspect_ratio"))
         if image_size is None:
             image_size = _normalize_image_size(qp.get("imageSize") or qp.get("image_size") or qp.get("resolution"))
+        if image_size is None:
+            image_size = _image_size_from_openai_quality(
+                qp.get("quality") or qp.get("imageQuality") or qp.get("image_quality")
+            )
         if image_size is None and qp.get("size"):
-            image_size = _normalize_image_size(qp.get("size"))
-        if image_size is None and qp.get("quality"):
-            image_size = _image_size_from_openai_quality(qp.get("quality"))
+            image_size = _tier_image_size(qp.get("size"))
         if duration_seconds is None:
             duration_seconds = _normalize_duration(qp.get("durationSeconds") or qp.get("duration_seconds") or qp.get("duration"))
 
