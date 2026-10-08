@@ -121,6 +121,26 @@ class ModelResolver2KTests(unittest.TestCase):
             "gemini-3.1-flash-image-square-2k",
         )
 
+    def test_explicit_aspect_ratio_wins_over_pixel_size(self):
+        # 显式 aspectRatio 与像素 size 冲突时显式值优先
+        request = SimpleNamespace(
+            __pydantic_extra__={"aspect_ratio": "16:9", "size": "1024x1024"}
+        )
+        self.assertEqual(
+            resolve_model_name("nano-banana-2", request, MODEL_CONFIG),
+            "gemini-3.1-flash-image-landscape",
+        )
+
+    def test_tier_size_and_quality_precedence(self):
+        # quality 优先于 size 档位
+        request = SimpleNamespace(
+            __pydantic_extra__={"size": "2k", "quality": "high"}
+        )
+        self.assertEqual(
+            resolve_model_name("nano-banana-2", request, MODEL_CONFIG),
+            "gemini-3.1-flash-image-landscape-4k",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -778,6 +778,11 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
         return _normalize_image_size(token)
 
     def _tier_image_size(value: Any) -> Optional[str]:
+        """识别并提取仅限 1k/2k/4k/1080p 的标准分辨率档位。
+
+        排除像素尺寸（如 1024x1024）与画质描述词（如 high/standard），
+        防止像素尺寸或 quality 字符串被误识别为分辨率档位。
+        """
         raw = _normalize_str(value)
         if not raw:
             return None
@@ -787,22 +792,32 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
         return None
 
     def _apply_image_config(image_config: Any, aspect_ratio: Optional[str], image_size: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        # 1. 读取 size_val
+        size_val = _read_value(image_config, "size")
+
+        # 2. 优先读取显式 aspectRatio/aspect_ratio
         if not aspect_ratio:
             aspect_ratio = _normalize_aspect_ratio(
                 _read_value(image_config, "aspectRatio", "aspect_ratio", "aspect")
             )
-        size_val = _read_value(image_config, "size")
+
+        # 3. 仅当显式画幅为空时，才从像素 size 推导画幅
         if not aspect_ratio and size_val:
             aspect_ratio = _aspect_from_openai_size(size_val)
 
+        # 4. 读取显式 imageSize/image_size/resolution
         if not image_size:
             image_size = _normalize_image_size(
                 _read_value(image_config, "imageSize", "image_size", "resolution")
             )
+
+        # 5. 若为空，从 quality 推导
         if not image_size:
             image_size = _image_size_from_openai_quality(
                 _read_value(image_config, "quality", "imageQuality", "image_quality")
             )
+
+        # 6. 若仍为空，从 size_val 中仅提取 1k/2k/4k/1080p 档位
         if not image_size and size_val:
             image_size = _tier_image_size(size_val)
 
@@ -825,23 +840,32 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
                 image_config, aspect_ratio, image_size
             )
 
-        # 字段直接在 generationConfig 顶层
+        # 1. 读取 size_val
+        size_val = _read_value(gen_config, "size")
+
+        # 2. 优先读取显式 aspectRatio/aspect_ratio
         if not aspect_ratio:
             aspect_ratio = _normalize_aspect_ratio(
                 _read_value(gen_config, "aspectRatio", "aspect_ratio")
             )
-        size_val = _read_value(gen_config, "size")
+
+        # 3. 仅当显式画幅为空时，才从像素 size 推导画幅
         if not aspect_ratio and size_val:
             aspect_ratio = _aspect_from_openai_size(size_val)
 
+        # 4. 读取显式 imageSize/image_size/resolution
         if not image_size:
             image_size = _normalize_image_size(
                 _read_value(gen_config, "imageSize", "image_size", "resolution")
             )
+
+        # 5. 若为空，从 quality 推导
         if not image_size:
             image_size = _image_size_from_openai_quality(
                 _read_value(gen_config, "quality", "imageQuality", "image_quality")
             )
+
+        # 6. 若仍为空，从 size_val 中仅提取 1k/2k/4k/1080p 档位
         if not image_size and size_val:
             image_size = _tier_image_size(size_val)
 
@@ -875,25 +899,36 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
                         image_config_raw, aspect_ratio, image_size
                     )
 
+                # 1. 读取 size_val
+                size_val = extra_gen_config.get("size")
+
+                # 2. 优先读取显式 aspectRatio/aspect_ratio
                 if aspect_ratio is None:
                     aspect_ratio = _normalize_aspect_ratio(
                         extra_gen_config.get("aspectRatio") or extra_gen_config.get("aspect_ratio")
                     )
-                if aspect_ratio is None and extra_gen_config.get("size"):
-                    aspect_ratio = _aspect_from_openai_size(extra_gen_config.get("size"))
 
+                # 3. 仅当显式画幅为空时，才从像素 size 推导画幅
+                if aspect_ratio is None and size_val:
+                    aspect_ratio = _aspect_from_openai_size(size_val)
+
+                # 4. 读取显式 imageSize/image_size/resolution
                 if image_size is None:
                     image_size = _normalize_image_size(
                         extra_gen_config.get("imageSize") or extra_gen_config.get("image_size") or extra_gen_config.get("resolution")
                     )
+
+                # 5. 若为空，从 quality 推导
                 if image_size is None:
                     image_size = _image_size_from_openai_quality(
                         extra_gen_config.get("quality")
                         or extra_gen_config.get("imageQuality")
                         or extra_gen_config.get("image_quality")
                     )
-                if image_size is None and extra_gen_config.get("size"):
-                    image_size = _tier_image_size(extra_gen_config.get("size"))
+
+                # 6. 若仍为空，从 size_val 中仅提取 1k/2k/4k/1080p 档位
+                if image_size is None and size_val:
+                    image_size = _tier_image_size(size_val)
 
                 if duration_seconds is None:
                     duration_seconds = _normalize_duration(
@@ -905,17 +940,27 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
     # 4) 顶层直接字段 (OpenAI 或其它客户端直传)
     if (aspect_ratio is None or image_size is None or duration_seconds is None):
         target_dict = request.__pydantic_extra__ if hasattr(request, "__pydantic_extra__") and request.__pydantic_extra__ else {}
+
+        # 1. 读取 size_val
         size_val = target_dict.get("size") or getattr(request, "size", None)
-        if aspect_ratio is None and size_val:
-            aspect_ratio = _aspect_from_openai_size(size_val)
+
+        # 2. 优先读取显式 aspectRatio/aspect_ratio
         if aspect_ratio is None:
             aspect_ratio = _normalize_aspect_ratio(
                 target_dict.get("aspect_ratio") or target_dict.get("aspectRatio") or getattr(request, "aspectRatio", None) or getattr(request, "aspect_ratio", None)
             )
+
+        # 3. 仅当显式画幅为空时，才从像素 size 推导画幅
+        if aspect_ratio is None and size_val:
+            aspect_ratio = _aspect_from_openai_size(size_val)
+
+        # 4. 读取显式 imageSize/image_size/resolution
         if image_size is None:
             image_size = _normalize_image_size(
                 target_dict.get("image_size") or target_dict.get("imageSize") or target_dict.get("resolution") or getattr(request, "imageSize", None) or getattr(request, "image_size", None)
             )
+
+        # 5. 若为空，从 quality 推导
         if image_size is None:
             image_size = _image_size_from_openai_quality(
                 target_dict.get("quality")
@@ -923,8 +968,11 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
                 or target_dict.get("image_quality")
                 or getattr(request, "quality", None)
             )
+
+        # 6. 若仍为空，从 size_val 中仅提取 1k/2k/4k/1080p 档位
         if image_size is None and size_val:
             image_size = _tier_image_size(size_val)
+
         if duration_seconds is None:
             duration_seconds = _normalize_duration(
                 target_dict.get("durationSeconds") or target_dict.get("duration_seconds") or target_dict.get("duration") or getattr(request, "durationSeconds", None) or getattr(request, "duration", None)
@@ -933,18 +981,32 @@ def _extract_generation_params(request, raw_request=None) -> Tuple[Optional[str]
     # 5) raw_request query params 兼容
     if raw_request is not None and hasattr(raw_request, "query_params"):
         qp = raw_request.query_params
-        if aspect_ratio is None and qp.get("size"):
-            aspect_ratio = _aspect_from_openai_size(qp.get("size"))
+
+        # 1. 读取 size_val
+        size_val = qp.get("size")
+
+        # 2. 优先读取显式 aspectRatio/aspect_ratio
         if aspect_ratio is None:
             aspect_ratio = _normalize_aspect_ratio(qp.get("aspectRatio") or qp.get("aspect_ratio"))
+
+        # 3. 仅当显式画幅为空时，才从像素 size 推导画幅
+        if aspect_ratio is None and size_val:
+            aspect_ratio = _aspect_from_openai_size(size_val)
+
+        # 4. 读取显式 imageSize/image_size/resolution
         if image_size is None:
             image_size = _normalize_image_size(qp.get("imageSize") or qp.get("image_size") or qp.get("resolution"))
+
+        # 5. 若为空，从 quality 推导
         if image_size is None:
             image_size = _image_size_from_openai_quality(
                 qp.get("quality") or qp.get("imageQuality") or qp.get("image_quality")
             )
-        if image_size is None and qp.get("size"):
-            image_size = _tier_image_size(qp.get("size"))
+
+        # 6. 若仍为空，从 size_val 中仅提取 1k/2k/4k/1080p 档位
+        if image_size is None and size_val:
+            image_size = _tier_image_size(size_val)
+
         if duration_seconds is None:
             duration_seconds = _normalize_duration(qp.get("durationSeconds") or qp.get("duration_seconds") or qp.get("duration"))
 
