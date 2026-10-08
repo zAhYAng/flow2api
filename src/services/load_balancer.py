@@ -146,6 +146,7 @@ class LoadBalancer:
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
         exclude_token_ids: Optional[set[int]] = None,
+        validate_token: bool = True,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -162,6 +163,9 @@ class LoadBalancer:
             track_pending:
                 Whether to count the selected token as a queued request immediately.
                 This smooths burst distribution before the hard concurrency slot is acquired.
+            validate_token:
+                Whether to validate/refresh the selected token with upstream services.
+                Disable only when the caller performs validation in its background job.
 
         Returns:
             Selected token or None if no available tokens
@@ -297,10 +301,11 @@ class LoadBalancer:
             token = item["token"]
             token_id = token.id
 
-            token = await self.token_manager.ensure_valid_token(token)
-            if not token:
-                debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期")
-                continue
+            if validate_token:
+                token = await self.token_manager.ensure_valid_token(token)
+                if not token:
+                    debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期")
+                    continue
 
             if reserve and not await self._reserve_slot(token.id, for_image_generation, for_video_generation):
                 debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token.id}: 预占槽位失败")

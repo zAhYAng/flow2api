@@ -1305,11 +1305,12 @@ class GenerationHandler:
     async def enqueue_gemini_video(self, model: str, prompt: str, images: List[bytes]) -> str:
         """快速入队并返回本地 operation，后台异步提交到 Flow"""
         import uuid
-        
+
         # 选择账号
         token = await self.load_balancer.select_token(
             for_video_generation=True, model=model, reserve=False,
             enforce_concurrency_filter=False, track_pending=True,
+            validate_token=False,
         )
         if not token:
             raise ValueError("No available video token")
@@ -1353,42 +1354,42 @@ class GenerationHandler:
                 token = await self.db.get_token(token_id)
                 if not token:
                     raise ValueError("Video account is no longer available")
-                
+
                 token = await self.token_manager.ensure_valid_token(token)
                 if not token:
                     raise ValueError("Video access token is invalid")
-                
+
                 if not supports_model_for_tier(model, token.user_paygate_tier):
                     raise ValueError("Account tier does not support this video model")
-                
+
                 project_id = await self.token_manager.ensure_project_exists(token.id)
                 await self.flow_client.prefill_remote_browser_pool(
                     project_id=project_id, action="VIDEO_GENERATION", token_id=token.id,
                 )
-                
+
                 model_key, _ = self._resolve_video_model_key_for_tier(
                     model_config, normalize_user_paygate_tier(token.user_paygate_tier),
                 )
-                
+
                 kwargs = dict(
                     at=token.at, project_id=project_id, prompt=prompt,
                     aspect_ratio=model_config["aspect_ratio"],
                     user_paygate_tier=normalize_user_paygate_tier(token.user_paygate_tier),
                     token_id=token.id, token_video_concurrency=token.video_concurrency,
                 )
-                
+
                 if images:
                     image_count = len(images)
                     if model_config.get("video_type") not in {"i2v", "omni"} or not 1 <= image_count <= model_config.get("max_images", 0):
                         raise ValueError("Model does not support this number of input images")
-                    
+
                     media_ids = [
                         await self.flow_client.upload_image(
                             token.at, image, model_config["aspect_ratio"], project_id=project_id,
                         )
                         for image in images
                     ]
-                    
+
                     if image_count == 2:
                         if model_config["video_type"] == "omni":
                             model_key = model_config.get("start_end_model_key", "abra_i2v_8s")
@@ -1413,16 +1414,16 @@ class GenerationHandler:
                         **kwargs, model_key=model_key,
                         use_v2_model_config=bool(model_config.get("use_v2_model_config", False)),
                     )
-                
+
                 operations = result.get("operations") or []
                 if not operations:
                     raise RuntimeError("Video submission returned no operation")
-                
+
                 operation = operations[0]
                 upstream_operation_id = (operation.get("operation") or {}).get("name")
                 if not upstream_operation_id:
                     raise RuntimeError("Video submission returned no operation ID")
-                
+
                 # 创建 request log（使用本地 operation name）
                 request_payload = {
                     "model": model,
@@ -1449,11 +1450,12 @@ class GenerationHandler:
                     status_text="video_submitting",
                     progress=25,
                 )
-                
+
                 # 更新为 processing 状态
                 await self.db.update_task(
                     local_id,
                     status="processing",
+                    model=model_key,
                     upstream_operation_id=upstream_operation_id,
                     project_id=project_id,
                     scene_id=operation.get("sceneId"),
@@ -1461,10 +1463,10 @@ class GenerationHandler:
                     request_log_id=log_id,
                     progress=25,
                 )
-                
+
             finally:
                 await self.load_balancer.release_pending(token_id, for_video_generation=True)
-                
+
         except Exception as e:
             await self._fail_gemini_video_submission(
                 local_id, token_id, model, prompt, images, e,
@@ -1475,7 +1477,30 @@ class GenerationHandler:
             self._background_submissions.pop(local_id, None)
 
     @staticmethod
-    def _gemini_video_submission_error_code(error: Exception) -> int:
+    def _is_upstream_video_submission_error(error: Exception) -> bool:
+        """只识别明确的 Flow 边界错误，沿包装链查找被隐藏的上传/协议失败。"""
+        markers = (
+            "project-scoped image upload failed",
+            "invalid upload response",
+            "legacy upload response missing media id",
+            "video submission returned no operation",
+            "flow api request failed", "flow api text request failed",
+            "flow video api request timed out after ",
+        )
+        seen = set()
+        current = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if any(marker in str(current).lower() for marker in markers):
+                return True
+            if current.__cause__ is not None:
+                current = current.__cause__
+            else:
+                current = None if current.__suppress_context__ else current.__context__
+        return False
+
+    @classmethod
+    def _gemini_video_submission_error_code(cls, error: Exception) -> int:
         """先识别明确的权限、账号和上游错误，再按异常类型兜底。"""
         message = str(error).lower()
         if any(marker in message for marker in (
@@ -1487,11 +1512,7 @@ class GenerationHandler:
             "token not found", "no available video token",
         )):
             return 503
-        if any(marker in message for marker in (
-            "video submission returned no operation",
-            "flow api request failed", "flow api text request failed",
-            "flow video api request timed out after ",
-        )):
+        if cls._is_upstream_video_submission_error(error):
             return 502
         return 400 if isinstance(error, ValueError) else 500
 
@@ -1538,7 +1559,7 @@ class GenerationHandler:
     async def wait_for_gemini_video_submission(self, name: str, timeout: float = 30.0) -> None:
         """等待后台提交完成（测试辅助方法）"""
         local_id = name.removeprefix("operations/")
-        
+
         # 先尝试获取后台任务引用
         bg_task = self._background_submissions.get(local_id)
 
@@ -1556,10 +1577,10 @@ class GenerationHandler:
             task = await self.db.get_task(local_id)
             if not task or task.status != "submitting":
                 break
-            
+
             if asyncio.get_event_loop().time() - start_time > timeout:
                 raise TimeoutError(f"Submission timeout after {timeout}s")
-            
+
             await asyncio.sleep(0.1)
 
 
@@ -1568,7 +1589,7 @@ class GenerationHandler:
         task = await self.db.get_task(operation_id)
         if not task:
             return None
-        
+
         # 处理 submitting 状态
         if task.status == "submitting":
             # 检查后台任务是否仍在运行
@@ -1576,7 +1597,7 @@ class GenerationHandler:
                 bg_task = self._background_submissions[operation_id]
                 if not bg_task.done():
                     return {"name": name, "done": False}
-            
+
             # 后台任务不存在或已完成，重新读 DB 防止 stale 状态
             fresh_task = await self.db.get_task(operation_id)
             if fresh_task and fresh_task.status != "submitting":
@@ -1599,7 +1620,7 @@ class GenerationHandler:
                         "message": "Service restart interrupted submission",
                     },
                 }
-        
+
         # 处理 failed 状态
         if task.status == "failed":
             return {
@@ -1610,7 +1631,7 @@ class GenerationHandler:
                     "message": task.error_message or "Video generation failed",
                 },
             }
-        
+
         # 处理 processing 状态 - 使用 upstream_operation_id（新路径）或 task_id（旧路径）
         if task.status == "processing":
             # 旧路径：task_id 就是上游 operation_id，project_id 已设置
@@ -1949,7 +1970,7 @@ class GenerationHandler:
         start_time = time.time()
         token = None
         generation_type = None
-        pending_token_state = {"active": False}
+        pending_token_state = {"active": False, "token_id": None}
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
         perf_trace: Dict[str, Any] = {
             "request_id": request_id,
@@ -2003,87 +2024,96 @@ class GenerationHandler:
             request_payload["image_fallback_attempts"] = image_fallback_attempts
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
-        # Create the log before any network work so non-streaming requests are
-        # visible in the admin panel while they are still running.
-        request_log_state["id"] = await self._log_request(
-            token_id=None,
-            operation=request_operation,
-            request_data=request_payload,
-            response_data={"status": "processing", "status_text": "started", "progress": 0, "request_id": request_id},
-            status_code=102,
-            duration=0,
-            status_text="started",
-            progress=0,
-        )
-
-        # 向用户展示开始信息
-        if stream:
-            yield self._create_stream_chunk(
-                f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
-                role="assistant"
-            )
-
-        # 2. 选择Token
-        debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
-        token_select_started_at = time.time()
-
-        if generation_type == "image":
-            token = await self.load_balancer.select_token(
-                for_image_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        else:
-            token = await self.load_balancer.select_token(
-                for_video_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        perf_trace["token_select_ms"] = int((time.time() - token_select_started_at) * 1000)
-
-        if not token:
-            error_msg = None
-            if self.load_balancer and hasattr(self.load_balancer, "get_unavailable_reason"):
-                error_msg = await self.load_balancer.get_unavailable_reason(
-                    for_image_generation=(generation_type == "image"),
-                    for_video_generation=(generation_type == "video"),
-                    model=model,
-                )
-            if not error_msg:
-                error_msg = self._get_no_token_error_message(generation_type)
-            debug_logger.log_error(f"[GENERATION] {error_msg}")
-            record_generation_result(generation_type, "no_token", time.time() - start_time)
-            await self._log_request(
+        fallback_log_state = None
+        try:
+            # Create the log before any network work so non-streaming requests are
+            # visible in the admin panel while they are still running.
+            initial_log = asyncio.create_task(self._log_request(
                 token_id=None,
                 operation=request_operation,
                 request_data=request_payload,
-                response_data={"error": error_msg, "performance": perf_trace},
-                status_code=503,
-                duration=time.time() - start_time,
-                log_id=request_log_state.get("id"),
-                status_text="failed",
-                progress=request_log_state.get("progress", 0),
-            )
+                response_data={"status": "processing", "status_text": "started", "progress": 0, "request_id": request_id},
+                status_code=102,
+                duration=0,
+                status_text="started",
+                progress=0,
+            ))
+            try:
+                request_log_state["id"] = await asyncio.shield(initial_log)
+            except asyncio.CancelledError:
+                # SQLite may have committed before cancellation reaches this await.
+                # Drain the insert and retain its ID so the same log can be terminated.
+                request_log_state["id"] = await initial_log
+                raise
+
+            # 向用户展示开始信息
             if stream:
-                yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=503)
-            return
+                yield self._create_stream_chunk(
+                    f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
+                    role="assistant"
+                )
 
-        debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
-        pending_token_state["active"] = True
-        await self._update_request_log_progress(
-            request_log_state,
-            token_id=token.id,
-            status_text="token_selected",
-            progress=8,
-            response_extra={"token_email": token.email},
-        )
+            # 2. 选择Token
+            debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
+            token_select_started_at = time.time()
 
-        try:
+            if generation_type == "image":
+                token = await self.load_balancer.select_token(
+                    for_image_generation=True,
+                    model=model,
+                    reserve=False,
+                    enforce_concurrency_filter=False,
+                    track_pending=True,
+                )
+            else:
+                token = await self.load_balancer.select_token(
+                    for_video_generation=True,
+                    model=model,
+                    reserve=False,
+                    enforce_concurrency_filter=False,
+                    track_pending=True,
+                )
+            if token:
+                pending_token_state.update(active=True, token_id=token.id)
+            perf_trace["token_select_ms"] = int((time.time() - token_select_started_at) * 1000)
+
+            if not token:
+                error_msg = None
+                if self.load_balancer and hasattr(self.load_balancer, "get_unavailable_reason"):
+                    error_msg = await self.load_balancer.get_unavailable_reason(
+                        for_image_generation=(generation_type == "image"),
+                        for_video_generation=(generation_type == "video"),
+                        model=model,
+                    )
+                if not error_msg:
+                    error_msg = self._get_no_token_error_message(generation_type)
+                debug_logger.log_error(f"[GENERATION] {error_msg}")
+                record_generation_result(generation_type, "no_token", time.time() - start_time)
+                await self._log_request(
+                    token_id=None,
+                    operation=request_operation,
+                    request_data=request_payload,
+                    response_data={"error": error_msg, "performance": perf_trace},
+                    status_code=503,
+                    duration=time.time() - start_time,
+                    log_id=request_log_state.get("id"),
+                    status_text="failed",
+                    progress=request_log_state.get("progress", 0),
+                )
+                if stream:
+                    yield self._create_stream_chunk(f"错误: {error_msg}\n")
+                yield self._create_error_response(error_msg, status_code=503)
+                return
+
+            debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text="token_selected",
+                progress=8,
+                response_extra={"token_email": token.email},
+            )
+
             # 3. 确保AT有效
             debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
             if stream:
@@ -2102,6 +2132,12 @@ class GenerationHandler:
                 error_msg = "Token AT无效或刷新失败"
                 debug_logger.log_error(f"[GENERATION] {error_msg}")
                 record_generation_result(generation_type, "failed", time.time() - start_time)
+                await self._log_request(
+                    pending_token_state["token_id"], request_operation, request_payload,
+                    {"error": error_msg}, 503, time.time() - start_time,
+                    log_id=request_log_state.get("id"), status_text="failed",
+                    progress=request_log_state.get("progress", 0),
+                )
                 if stream:
                     yield self._create_stream_chunk(f"错误: {error_msg}\n")
                 yield self._create_error_response(error_msg, status_code=503)
@@ -2276,9 +2312,11 @@ class GenerationHandler:
                         break
 
                     current_token = next_token
+                    pending_token_state.update(active=True, token_id=next_token.id)
                     current_token = await self.token_manager.ensure_valid_token(current_token)
                     if not current_token:
                         await self.load_balancer.release_pending(next_token.id, for_image_generation=True)
+                        pending_token_state["active"] = False
                         await self._update_request_log_progress(
                             request_log_state,
                             token_id=primary_token_id,
@@ -2294,7 +2332,6 @@ class GenerationHandler:
                         "email": current_token.email,
                         "role": f"fallback_{fallback_attempt}"
                     })
-                    pending_token_state["active"] = True
                     try:
                         current_project_id = await self.token_manager.ensure_project_exists(current_token.id)
                         await self.flow_client.prefill_remote_browser_pool(
@@ -2473,9 +2510,11 @@ class GenerationHandler:
                         break
 
                     current_token = next_token
+                    pending_token_state.update(active=True, token_id=next_token.id)
                     current_token = await self.token_manager.ensure_valid_token(current_token)
                     if not current_token:
                         await self.load_balancer.release_pending(next_token.id, for_video_generation=True)
+                        pending_token_state["active"] = False
                         await self._update_request_log_progress(
                             request_log_state,
                             token_id=primary_token_id,
@@ -2491,7 +2530,6 @@ class GenerationHandler:
                         "email": current_token.email,
                         "role": f"fallback_{fallback_attempt}"
                     })
-                    pending_token_state["active"] = True
                     try:
                         current_project_id = await self.token_manager.ensure_project_exists(current_token.id)
                         await self.flow_client.prefill_remote_browser_pool(
@@ -2659,6 +2697,17 @@ class GenerationHandler:
                 status_text="failed",
                 progress=request_log_state.get("progress", 0),
             )
+            if fallback_log_state and fallback_log_state.get("id"):
+                await self._log_request(
+                    pending_token_state.get("token_id"),
+                    "图片兜底" if generation_type == "image" else "视频兜底",
+                    {**request_payload, "fallback_attempt": fallback_attempt,
+                     "primary_token_id": primary_token_id, "primary_token_email": primary_token_email},
+                    {"error": error_msg, "fallback_of": request_log_state.get("id")},
+                    499, time.time() - fallback_log_state.get("started_at", start_time),
+                    log_id=fallback_log_state["id"], status_text="failed",
+                    progress=fallback_log_state.get("progress", 0),
+                )
             raise
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
@@ -2694,10 +2743,10 @@ class GenerationHandler:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
             yield self._create_error_response(error_msg, status_code=500)
         finally:
-            active_tok = current_token if 'current_token' in locals() else token
-            if pending_token_state.get("active") and active_tok and self.load_balancer:
+            pending_token_id = pending_token_state.get("token_id")
+            if pending_token_state.get("active") and pending_token_id is not None and self.load_balancer:
                 await self.load_balancer.release_pending(
-                    active_tok.id,
+                    pending_token_id,
                     for_image_generation=(generation_type == "image"),
                     for_video_generation=(generation_type == "video"),
                 )
@@ -2767,7 +2816,7 @@ class GenerationHandler:
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
-        pending_token_state: Optional[Dict[str, bool]] = None,
+        pending_token_state: Optional[Dict[str, Any]] = None,
         emit_error_response: bool = True
     ) -> AsyncGenerator:
         """处理图片生成 (同步返回)"""
@@ -3054,7 +3103,7 @@ class GenerationHandler:
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
-        pending_token_state: Optional[Dict[str, bool]] = None,
+        pending_token_state: Optional[Dict[str, Any]] = None,
         video_media_id: Optional[str] = None,
         emit_error_response: bool = True,
     ) -> AsyncGenerator:

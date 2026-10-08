@@ -1,4 +1,4 @@
-﻿# Flow2API Fork
+# Flow2API Fork
 
 将 Google Flow 的图片和视频生成能力封装为 Gemini 请求体兼容 API，并通过仓库自带的 Chrome 扩展同步当前浏览器账号、刷新 ST/AT 和处理 reCAPTCHA。
 
@@ -158,7 +158,27 @@ curl "http://127.0.0.1:8000/v1beta/operations/OPERATION_ID" \
   -H "x-goog-api-key: $FLOW2API_KEY"
 ```
 
-提交响应包含 `name: "operations/OPERATION_ID"` 和 `done: false`。任务完成时轮询响应中 `done` 为 `true`，视频链接位于 `response.generateVideoResponse.generatedSamples[0].video.uri`。支持一个 `instances`；单张首帧可放在 `instances[0].image.bytesBase64Encoded` 并设置 `mimeType`。
+提交响应包含 `name: "operations/OPERATION_ID"` 和 `done: false`。轮询返回 HTTP 200 时，仍需检查任务结果：
+
+- `done: false`：仍在提交或生成，稍后继续轮询。
+- `done: true` 且有 `response`：生成成功，视频链接位于 `response.generateVideoResponse.generatedSamples[0].video.uri`。
+- `done: true` 且有 `error`：任务失败，读取 `error.code`、`error.status` 和 `error.message`，停止轮询。例如上游上传失败会返回：
+
+```json
+{
+  "name": "operations/OPERATION_ID",
+  "done": true,
+  "error": {
+    "code": 502,
+    "status": "UNAVAILABLE",
+    "message": "Project-scoped image upload failed via /flow/uploadImage"
+  }
+}
+```
+
+本地任务仍处于 `submitting`、尚未保存上游 operation ID 时，如果服务重启，首次轮询会将任务标记为失败（`done: true`，`error.code: 503`，`error.status: "UNAVAILABLE"`，消息为 `Service restart interrupted submission`）。服务不会自动重新提交，以免重复生成和扣点。已保存上游 operation ID 的 `processing` 任务可在重启后继续轮询。
+
+支持一个 `instances`；单张首帧可放在 `instances[0].image.bytesBase64Encoded` 并设置 `mimeType`。
 
 #### 视频生成：同步阻塞 `generateContent`（备用）
 

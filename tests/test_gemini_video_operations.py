@@ -868,13 +868,13 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         """异步提交成功时必须创建 request log，记录本地 operation name"""
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         local_id = name.replace("operations/", "")
         task = await self.db.get_task(local_id)
-        
+
         # 必须有 request_log_id
         self.assertIsNotNone(task.request_log_id, "request_log_id must be set")
-        
+
         log = await self.db.get_log_detail(task.request_log_id)
         self.assertEqual(log["status_code"], 102)
         self.assertEqual(log["status_text"], "video_submitting")
@@ -889,7 +889,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.balancer.release_pending.reset_mock()
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         # 应该被调用 1 次（后台任务中）
         # release_pending(token_id, for_video_generation=True)
         self.assertEqual(self.balancer.release_pending.await_count, 1)
@@ -903,7 +903,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.flow.generate_video_text.side_effect = ValueError("Account tier does not support this video model")
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         self.assertEqual(self.balancer.release_pending.await_count, 1)
 
         await self._assert_failed_operation(name, 403)
@@ -914,7 +914,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.flow.generate_video_text.side_effect = RuntimeError("Upstream API error")
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         self.assertEqual(self.balancer.release_pending.await_count, 1)
         self.assertEqual(await self.balancer._get_pending_count(self.token.id, False, True), 0)
 
@@ -935,11 +935,11 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_code_503_for_invalid_token(self):
         """无效 Token 必须使用 error_code=503"""
-        # 选择账号时有效，后台重新校验时失效。
-        self.manager.ensure_valid_token.side_effect = [self.token, None]
+        # enqueue 只读本地账号；首次上游校验发生在后台。
+        self.manager.ensure_valid_token.return_value = None
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         local_id = name.replace("operations/", "")
         task = await self.db.get_task(local_id)
         self.assertEqual(task.error_code, 503)
@@ -963,10 +963,10 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         """wait_for_gemini_video_submission 必须暴露后台异常，不能只超时"""
         self.flow.generate_video_text.side_effect = RuntimeError("Flow API crashed")
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
-        
+
         # 等待应该快速完成而不是超时，并且后续查询应显示失败状态
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         local_id = name.replace("operations/", "")
         task = await self.db.get_task(local_id)
         self.assertEqual(task.status, "failed")
@@ -976,18 +976,18 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         """后台 task 清理后重读状态，防止竞态中断"""
         name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         local_id = name.replace("operations/", "")
-        
+
         # 等待完成提交
         await self.handler.wait_for_gemini_video_submission(name)
-        
+
         # 此时任务应已转为 processing（成功提交） 或 failed
         task = await self.db.get_task(local_id)
         self.assertNotEqual(task.status, "submitting")
-        
+
         # 现在模拟手动清理后台任务字典并标记为 submitting（重启场景）
         self.handler._background_submissions.pop(local_id, None)
         await self.db.update_task(local_id, status="submitting")
-        
+
         # 轮询应该检测重启中断
         result = await self.handler.get_gemini_video_operation(name)
         self.assertTrue(result["done"])
@@ -1122,7 +1122,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_account_tier_rejection_returns_403_and_logs_failure(self):
         ultra_token = self.token.model_copy(update={"user_paygate_tier": "PAYGATE_TIER_TWO"})
         self.manager.get_active_tokens.return_value = [ultra_token]
-        self.manager.ensure_valid_token.side_effect = [ultra_token, self.token]
+        self.manager.ensure_valid_token.return_value = self.token
         name = await self.handler.enqueue_gemini_video(
             model="veo_3_1_t2v_fast_ultra_relaxed", prompt="cat", images=[],
         )
@@ -1132,7 +1132,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_paths_create_request_log_with_correct_codes(self):
         """失败路径（503/502）必须创建 request log"""
         # 测试 503 路径
-        self.manager.ensure_valid_token.side_effect = [self.token, None]
+        self.manager.ensure_valid_token.return_value = None
         name1 = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
         await self.handler.wait_for_gemini_video_submission(name1)
 
