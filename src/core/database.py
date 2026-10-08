@@ -419,7 +419,7 @@ class Database:
                         cache_enabled BOOLEAN DEFAULT 0,
                         cache_timeout INTEGER DEFAULT 7200,
                         cache_base_url TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -478,7 +478,7 @@ class Database:
                         personal_max_resident_tabs INTEGER DEFAULT 5,
                         browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
                         personal_idle_tab_ttl_seconds INTEGER DEFAULT 600,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -491,7 +491,7 @@ class Database:
                         id INTEGER PRIMARY KEY DEFAULT 1,
                         connection_token TEXT DEFAULT '',
                         auto_enable_on_update BOOLEAN DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -518,7 +518,7 @@ class Database:
                         notify_on_expired BOOLEAN DEFAULT 1,
                         daily_report_enabled BOOLEAN DEFAULT 0,
                         daily_report_time TEXT DEFAULT '22:00',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -729,7 +729,7 @@ class Database:
                     name TEXT,
                     remark TEXT,
                     is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_used_at TIMESTAMP,
                     use_count INTEGER DEFAULT 0,
                     credits INTEGER DEFAULT 0,
@@ -765,7 +765,7 @@ class Database:
                     project_name TEXT NOT NULL,
                     tool_name TEXT DEFAULT 'PINHOLE',
                     is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
                 )
             """)
@@ -805,10 +805,10 @@ class Database:
                     scene_id TEXT,
                     project_id TEXT,
                     media_name TEXT,
-                      request_log_id INTEGER,
-                      upstream_operation_id TEXT,
-                      error_code INTEGER,
-                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    request_log_id INTEGER,
+                    upstream_operation_id TEXT,
+                    error_code INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
                 )
@@ -826,7 +826,7 @@ class Database:
                     duration FLOAT NOT NULL,
                     status_text TEXT DEFAULT '',
                     progress INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
                 )
@@ -886,7 +886,7 @@ class Database:
                     cache_enabled BOOLEAN DEFAULT 0,
                     cache_timeout INTEGER DEFAULT 7200,
                     cache_base_url TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -899,7 +899,7 @@ class Database:
                     log_requests BOOLEAN DEFAULT 1,
                     log_responses BOOLEAN DEFAULT 1,
                     mask_token BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -931,7 +931,7 @@ class Database:
                     personal_max_resident_tabs INTEGER DEFAULT 5,
                     browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
                     personal_idle_tab_ttl_seconds INTEGER DEFAULT 600,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -942,7 +942,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     connection_token TEXT DEFAULT '',
                     auto_enable_on_update BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -965,7 +965,7 @@ class Database:
                     notify_on_expired BOOLEAN DEFAULT 1,
                     daily_report_enabled BOOLEAN DEFAULT 0,
                     daily_report_time TEXT DEFAULT '22:00',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -1009,7 +1009,7 @@ class Database:
                         duration FLOAT NOT NULL,
                         status_text TEXT DEFAULT '',
                         progress INTEGER DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (token_id) REFERENCES tokens(id)
                     )
