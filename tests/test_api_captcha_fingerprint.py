@@ -60,8 +60,8 @@ class _FakeAsyncSession:
 class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
     async def test_api_captcha_returns_token_and_user_agent(self):
         """_get_api_captcha_token 必须返回 (token, userAgent) 元组。"""
-        flow = FlowClient.__new__(FlowClient)
-        flow.proxy_manager = _FakeProxyManager()
+        fake_proxy_manager = _FakeProxyManager()
+        flow = FlowClient(proxy_manager=fake_proxy_manager)
         fake_session = _FakeAsyncSession()
 
         with patch("src.services.flow_client.AsyncSession", lambda *a, **kw: fake_session), \
@@ -78,6 +78,7 @@ class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
                 action="IMAGE_GENERATION",
             )
 
+        self.assertEqual(fake_session._calls, 2, "Fake session post 应被调用两次")
         self.assertIsNotNone(result, "函数不应返回 None, 因为我们 mock 了 ready 状态")
         self.assertIsInstance(result, tuple, "_get_api_captcha_token 应返回 (token, userAgent) 元组")
         token, user_agent = result
