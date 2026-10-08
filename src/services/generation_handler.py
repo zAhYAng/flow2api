@@ -1196,6 +1196,7 @@ class GenerationHandler:
             proxy_manager=proxy_manager,
             flow_client=flow_client,
         )
+        self._background_submissions = {}  # local_id -> asyncio.Task
 
     async def submit_gemini_video(self, model: str, prompt: str, images: List[bytes]) -> str:
         model_config = MODEL_CONFIG[model]
@@ -1301,12 +1302,239 @@ class GenerationHandler:
         finally:
             await self.load_balancer.release_pending(token_id, for_video_generation=True)
 
+    async def enqueue_gemini_video(self, model: str, prompt: str, images: List[bytes]) -> str:
+        """快速入队并返回本地 operation，后台异步提交到 Flow"""
+        import uuid
+        
+        # 选择账号
+        token = await self.load_balancer.select_token(
+            for_video_generation=True, model=model, reserve=False,
+            enforce_concurrency_filter=False, track_pending=False,  # 后台再 track
+        )
+        if not token:
+            raise ValueError("No available video token")
+        
+        # 生成本地 UUID
+        local_id = str(uuid.uuid4())
+        
+        # 持久化 submitting 状态任务
+        model_config = MODEL_CONFIG[model]
+        model_key, _ = self._resolve_video_model_key_for_tier(
+            model_config, normalize_user_paygate_tier(token.user_paygate_tier),
+        )
+        
+        await self.db.create_task(Task(
+            task_id=local_id,
+            token_id=token.id,
+            model=model_key,
+            prompt=prompt,
+            status="submitting",
+            progress=0,
+        ))
+        
+        # 创建后台任务
+        task = asyncio.create_task(
+            self._submit_gemini_video_operation(local_id, token.id, model, prompt, images)
+        )
+        self._background_submissions[local_id] = task
+        
+        return f"operations/{local_id}"
+
+    async def _submit_gemini_video_operation(
+        self, local_id: str, token_id: int, model: str, prompt: str, images: List[bytes]
+    ) -> None:
+        """后台提交 Flow 视频生成请求"""
+        try:
+            # 复用现有提交逻辑
+            model_config = MODEL_CONFIG[model]
+            
+            # Track pending
+            await self.load_balancer.track_pending(token_id, for_video_generation=True)
+            
+            try:
+                token = await self.db.get_token(token_id)
+                if not token:
+                    raise ValueError("Video account is no longer available")
+                
+                token = await self.token_manager.ensure_valid_token(token)
+                if not token:
+                    raise ValueError("Video access token is invalid")
+                
+                if not supports_model_for_tier(model, token.user_paygate_tier):
+                    await self.db.update_task(
+                        local_id,
+                        status="failed",
+                        error_code=403,
+                        error_message="Account tier does not support this video model",
+                        completed_at=time.time(),
+                    )
+                    return
+                
+                project_id = await self.token_manager.ensure_project_exists(token.id)
+                await self.flow_client.prefill_remote_browser_pool(
+                    project_id=project_id, action="VIDEO_GENERATION", token_id=token.id,
+                )
+                
+                model_key, _ = self._resolve_video_model_key_for_tier(
+                    model_config, normalize_user_paygate_tier(token.user_paygate_tier),
+                )
+                
+                kwargs = dict(
+                    at=token.at, project_id=project_id, prompt=prompt,
+                    aspect_ratio=model_config["aspect_ratio"],
+                    user_paygate_tier=normalize_user_paygate_tier(token.user_paygate_tier),
+                    token_id=token.id, token_video_concurrency=token.video_concurrency,
+                )
+                
+                if images:
+                    image_count = len(images)
+                    if model_config.get("video_type") not in {"i2v", "omni"} or not 1 <= image_count <= model_config.get("max_images", 0):
+                        raise ValueError("Model does not support this number of input images")
+                    
+                    media_ids = [
+                        await self.flow_client.upload_image(
+                            token.at, image, model_config["aspect_ratio"], project_id=project_id,
+                        )
+                        for image in images
+                    ]
+                    
+                    if image_count == 2:
+                        if model_config["video_type"] == "omni":
+                            model_key = model_config.get("start_end_model_key", "abra_i2v_8s")
+                        result = await self.flow_client.generate_video_start_end(
+                            **kwargs, model_key=model_key, start_media_id=media_ids[0], end_media_id=media_ids[1],
+                            use_v2_model_config=bool(model_config.get("use_v2_model_config", False)),
+                        )
+                    else:
+                        if model_config["video_type"] == "omni":
+                            model_key = model_config.get("first_frame_model_key", "abra_i2v_8s")
+                        else:
+                            model_key = model_key.replace("_fl_", "_")
+                            if model_key.endswith("_fl"):
+                                model_key = model_key[:-3]
+                        result = await self.flow_client.generate_video_start_image(
+                            **kwargs, model_key=model_key, start_media_id=media_ids[0], use_v2_model_config=True,
+                        )
+                else:
+                    if model_config.get("video_type") not in {"t2v", "omni"}:
+                        raise ValueError("Model requires an input image")
+                    result = await self.flow_client.generate_video_text(
+                        **kwargs, model_key=model_key,
+                        use_v2_model_config=bool(model_config.get("use_v2_model_config", False)),
+                    )
+                
+                operations = result.get("operations") or []
+                if not operations:
+                    raise RuntimeError("Video submission returned no operation")
+                
+                operation = operations[0]
+                upstream_operation_id = (operation.get("operation") or {}).get("name")
+                if not upstream_operation_id:
+                    raise RuntimeError("Video submission returned no operation ID")
+                
+                # 更新为 processing 状态
+                await self.db.update_task(
+                    local_id,
+                    status="processing",
+                    upstream_operation_id=upstream_operation_id,
+                    project_id=project_id,
+                    scene_id=operation.get("sceneId"),
+                    media_name=operation.get("mediaName") or upstream_operation_id,
+                    progress=25,
+                )
+                
+            finally:
+                await self.load_balancer.release_pending(token_id, for_video_generation=True)
+                
+        except ValueError as e:
+            # 权限或账号问题
+            error_msg = str(e)
+            error_code = 403 if "tier" in error_msg.lower() or "support" in error_msg.lower() else 400
+            await self.db.update_task(
+                local_id,
+                status="failed",
+                error_code=error_code,
+                error_message=error_msg,
+                completed_at=time.time(),
+            )
+        except Exception as e:
+            # 普通上游失败
+            await self.db.update_task(
+                local_id,
+                status="failed",
+                error_code=500,
+                error_message=str(e),
+                completed_at=time.time(),
+            )
+        finally:
+            # 清理后台任务追踪
+            self._background_submissions.pop(local_id, None)
+
+    async def wait_for_gemini_video_submission(self, name: str, timeout: float = 30.0) -> None:
+        """等待后台提交完成（测试辅助方法）"""
+        local_id = name.removeprefix("operations/")
+        start_time = asyncio.get_event_loop().time()
+        
+        while True:
+            task = await self.db.get_task(local_id)
+            if not task or task.status != "submitting":
+                break
+            
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                raise TimeoutError(f"Submission timeout after {timeout}s")
+            
+            await asyncio.sleep(0.1)
+
+
     async def get_gemini_video_operation(self, name: str) -> Optional[Dict[str, Any]]:
         operation_id = name.removeprefix("operations/")
         task = await self.db.get_task(operation_id)
-        if not task or not task.project_id:
+        if not task:
             return None
+        
+        # 处理 submitting 状态
+        if task.status == "submitting":
+            # 检查后台任务是否仍在运行
+            if operation_id in self._background_submissions:
+                bg_task = self._background_submissions[operation_id]
+                if not bg_task.done():
+                    return {"name": name, "done": False}
+            
+            # 后台任务不存在或已完成，但任务仍是 submitting -> 服务重启中断
+            await self.db.update_task(
+                operation_id,
+                status="failed",
+                error_code=503,
+                error_message="Service restart interrupted submission",
+                completed_at=time.time(),
+            )
+            return {
+                "name": name,
+                "done": True,
+                "error": {
+                    "code": 503,
+                    "message": "Service restart interrupted submission",
+                },
+            }
+        
+        # 处理 failed 状态
+        if task.status == "failed":
+            return {
+                "name": name,
+                "done": True,
+                "error": {
+                    "code": task.error_code or 500,
+                    "message": task.error_message or "Video generation failed",
+                },
+            }
+        
+        # 处理 processing 状态 - 使用 upstream_operation_id（新路径）或 task_id（旧路径）
         if task.status == "processing":
+            # 旧路径：task_id 就是上游 operation_id，project_id 已设置
+            # 新路径：upstream_operation_id 是上游 ID，task_id 是本地 UUID
+            upstream_op_id = task.upstream_operation_id or task.task_id
+            if not task.project_id:
+                return {"name": name, "done": False}
             token = await self.db.get_token(task.token_id)
             if not token:
                 raise ValueError("Video account is no longer available")
@@ -1320,7 +1548,7 @@ class GenerationHandler:
                 if not token:
                     raise ValueError("Video access token is invalid")
             operation = {
-                "operation": {"name": task.task_id},
+                "operation": {"name": task.upstream_operation_id or task.task_id},
                 "mediaName": task.media_name or task.task_id,
                 "projectId": task.project_id,
             }

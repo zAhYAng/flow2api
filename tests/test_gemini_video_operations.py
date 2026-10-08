@@ -275,7 +275,7 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ensure_project_exists=AsyncMock(return_value="project-1"),
             record_usage=AsyncMock(), record_success=AsyncMock(),
         )
-        self.balancer = SimpleNamespace(select_token=AsyncMock(return_value=token), release_pending=AsyncMock())
+        self.balancer = SimpleNamespace(select_token=AsyncMock(return_value=token), release_pending=AsyncMock(), track_pending=AsyncMock())
         self.handler = GenerationHandler(self.flow, self.manager, self.balancer, self.db, None, None)
 
     async def asyncTearDown(self):
@@ -355,6 +355,43 @@ class GeminiVideoPersistenceTests(unittest.IsolatedAsyncioTestCase):
         refreshed = await self.handler.get_gemini_video_operation(name)
         self.assertTrue(refreshed["done"])
         self.assertNotEqual(finished, refreshed)
+
+    async def test_enqueue_returns_local_operation_and_submits_in_background(self):
+        """入队立即返回本地 operation，后台异步提交到 Flow"""
+        name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
+        self.assertTrue(name.startswith("operations/"))
+        local_id = name.replace("operations/", "")
+        pending = await self.handler.get_gemini_video_operation(name)
+        self.assertEqual(pending["done"], False)
+        await self.handler.wait_for_gemini_video_submission(name)
+        task = await self.db.get_task(local_id)
+        self.assertEqual(task.upstream_operation_id, "op-123")
+        self.assertEqual(task.status, "processing")
+
+    async def test_enqueue_with_permission_denied_persists_error_code(self):
+        """后台提交遇到权限拒绝时持久化 error_code"""
+        self.flow.generate_video_text.side_effect = ValueError("Account tier does not support this video model")
+        name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
+        await self.handler.wait_for_gemini_video_submission(name)
+        local_id = name.replace("operations/", "")
+        task = await self.db.get_task(local_id)
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(task.error_code, 403)
+        self.assertIn("tier", task.error_message.lower())
+
+    async def test_enqueue_with_upstream_failure_persists_gemini_error(self):
+        """后台提交遇到普通上游失败时持久化 Gemini 错误"""
+        self.flow.generate_video_text.side_effect = RuntimeError("Video submission returned no operation")
+        name = await self.handler.enqueue_gemini_video(model="veo_3_1_t2v_fast_landscape", prompt="cat", images=[])
+        await self.handler.wait_for_gemini_video_submission(name)
+        local_id = name.replace("operations/", "")
+        task = await self.db.get_task(local_id)
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(task.error_code, 500)
+        failed = await self.handler.get_gemini_video_operation(name)
+        self.assertTrue(failed["done"])
+        self.assertIn("error", failed)
+        self.assertEqual(failed["error"]["code"], 500)
 
 
 if __name__ == "__main__":
