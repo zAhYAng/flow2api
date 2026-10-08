@@ -107,6 +107,8 @@ class Task(BaseModel):
     project_id: Optional[str] = None
     media_name: Optional[str] = None
     request_log_id: Optional[int] = None
+    upstream_operation_id: Optional[str] = None
+    error_code: Optional[int] = None
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
