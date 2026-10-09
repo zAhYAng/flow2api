@@ -1,5 +1,16 @@
 # Flow2API Captcha Worker 更新记录
 
+## 1.1.37（2026-09-28）
+
+本节依据提交 `971d8af` 补记已有构建的内容；补记不改变插件功能或 `manifest.json` 中的版本号。
+
+- 整合 `recaptcha_hook.js`，在 Flow 页面 MAIN world 的 `document_start` 阶段捕获 reCAPTCHA 执行函数，并使用 `flow.google.com/about` 专用页面及 Trusted Types 参数生成验证码。
+- 验证码响应携带浏览器真实 `User-Agent`、语言及 UA Client Hints，供后端对齐请求指纹。
+- 整合 WebSocket 连接策略和每 30 秒检查一次的保活 Alarm，避免并发建立重复连接及旧连接事件干扰当前连接。
+- 整合 Flow 项目地址识别，支持新旧地址、`pendingUrl` 和活动标签页优先选择；导入时传递真实项目 ID，缺少项目时尝试通过 Flow 页面创建项目。
+
+版本沿革：该历史提交将清单版本从 `1.1.49` 恢复为 `1.1.37`，同时更新日志仅保留到 `1.1.35`。以上是当前构建的补充说明，并非在 `1.1.49` 基础上新增的功能；版本新旧应结合提交历史判断。当前 Git 历史未找到独立的 `1.1.36` 清单版本提交，因此不补写未经证实的版本记录。
+
 ## 1.1.35
 
 - 验证码响应携带真实浏览器 `User-Agent`、`Accept-Language` 和 UA Client Hints。
