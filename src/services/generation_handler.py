@@ -1661,6 +1661,8 @@ class GenerationHandler:
             if checked:
                 checked_operation = checked[0]
                 status = checked_operation.get("status") or ""
+                if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+                    await self._sync_video_credits_from_upstream(token.id, result)
                 if status == "MEDIA_GENERATION_STATUS_ACTIVE":
                     if task.request_log_id:
                         await self.db.update_request_log(
@@ -1845,6 +1847,51 @@ class GenerationHandler:
             generation_result["success"] = True
             generation_result["error_message"] = None
             generation_result["error_emitted"] = False
+
+    @staticmethod
+    def _extract_remaining_credits(upstream_result: Any) -> Optional[int]:
+        """Extract an authoritative remainingCredits value from an upstream response."""
+        if not isinstance(upstream_result, dict):
+            return None
+        raw = upstream_result.get("remainingCredits")
+        try:
+            credits = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return credits if credits >= 0 else None
+
+    def _schedule_credit_refresh(self, token_id: int) -> None:
+        """Refresh account credits in the background when upstream omitted them."""
+        refresh_credits = getattr(self.token_manager, "refresh_credits", None)
+        if not callable(refresh_credits):
+            debug_logger.log_warning(
+                f"[GENERATION] TokenManager 不支持异步余额刷新 token_id={token_id}"
+            )
+            return
+        task = asyncio.create_task(refresh_credits(token_id))
+
+        def _consume_refresh_result(completed_task: asyncio.Task) -> None:
+            try:
+                completed_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                debug_logger.log_warning(
+                    f"[GENERATION] 异步刷新视频余额失败 token_id={token_id}: {exc}"
+                )
+
+        task.add_done_callback(_consume_refresh_result)
+
+    async def _sync_video_credits_from_upstream(
+        self,
+        token_id: int,
+        upstream_result: Any,
+    ) -> None:
+        credits = self._extract_remaining_credits(upstream_result)
+        if credits is not None:
+            await self.db.update_token(token_id, credits=credits)
+            return
+        self._schedule_credit_refresh(token_id)
 
     async def _resolve_video_asset(
         self,
@@ -3541,6 +3588,7 @@ class GenerationHandler:
 
                 # 检查状态
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+                    await self._sync_video_credits_from_upstream(token.id, result)
                     try:
                         resolved_video = await self._resolve_video_asset(token, operation)
                     except Exception as redirect_error:

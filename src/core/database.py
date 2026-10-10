@@ -4,10 +4,11 @@ import aiosqlite
 import json
 import re
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
+from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type, config
 from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, TokenRefreshConfig, WebhookConfig
 
 
@@ -34,9 +35,32 @@ class Database:
         await db.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
         await db.execute("PRAGMA foreign_keys = ON")
 
+    def _business_timezone(self) -> ZoneInfo:
+        """Return the configured business timezone, with a safe product default."""
+        timezone_name = getattr(config, "stats_timezone", "Asia/Shanghai")
+        try:
+            return ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, TypeError):
+            return ZoneInfo("Asia/Shanghai")
+
+    def _business_now(self) -> datetime:
+        """Return the current instant rendered in the business timezone."""
+        return datetime.now(timezone.utc).astimezone(self._business_timezone())
+
     def _current_stats_date(self) -> str:
         """Return the logical date used by daily token statistics."""
-        return date.today().isoformat()
+        return self._business_now().date().isoformat()
+
+    def _current_stats_utc_window(self) -> tuple[str, str]:
+        """Return the current business-day bounds as UTC SQLite timestamps."""
+        business_now = self._business_now()
+        local_start = business_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_end = local_start + timedelta(days=1)
+        utc = timezone.utc
+        return (
+            local_start.astimezone(utc).strftime("%Y-%m-%d %H:%M:%S"),
+            local_end.astimezone(utc).strftime("%Y-%m-%d %H:%M:%S"),
+        )
 
     @staticmethod
     def _normalize_video_duration(value: Any) -> Optional[int]:
@@ -1179,6 +1203,19 @@ class Database:
             token_data = dict(token_row) if token_row else {}
             stats_data = dict(stats_row) if stats_row else {}
 
+            day_start_utc, day_end_utc = self._current_stats_utc_window()
+            daily_cursor = await db.execute("""
+                SELECT
+                    COUNT(*) AS today_requests,
+                    COALESCE(SUM(CASE WHEN operation IN ('generate_image', '图片兜底') AND status_code = 200 THEN 1 ELSE 0 END), 0) AS today_images,
+                    COALESCE(SUM(CASE WHEN operation IN ('generate_video', '视频兜底') AND status_code = 200 THEN 1 ELSE 0 END), 0) AS today_videos,
+                    COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
+                FROM request_logs
+                WHERE created_at >= ? AND created_at < ?
+            """, (day_start_utc, day_end_utc))
+            daily_row = await daily_cursor.fetchone()
+            daily_data = dict(daily_row) if daily_row else {}
+            daily_source = daily_data if int(daily_data.get("today_requests") or 0) else stats_data
             video_logs_cursor = await db.execute("""
                 SELECT request_body, created_at
                 FROM request_logs
@@ -1190,7 +1227,7 @@ class Database:
                 cost = self._estimate_video_credit_cost(row[0])
                 total_video_credits += cost
                 created_at = str(row[1] or "")
-                if created_at.startswith(today):
+                if day_start_utc <= created_at < day_end_utc:
                     today_video_credits += cost
 
             return {
@@ -1201,10 +1238,10 @@ class Database:
                 "total_videos": int(stats_data.get("total_videos") or 0),
                 "total_video_credits": int(total_video_credits),
                 "total_errors": int(stats_data.get("total_errors") or 0),
-                "today_images": int(stats_data.get("today_images") or 0),
-                "today_videos": int(stats_data.get("today_videos") or 0),
+                "today_images": int(daily_source.get("today_images") or 0),
+                "today_videos": int(daily_source.get("today_videos") or 0),
                 "today_video_credits": int(today_video_credits),
-                "today_errors": int(stats_data.get("today_errors") or 0)
+                "today_errors": int(daily_source.get("today_errors") or 0)
             }
 
     async def get_system_info_stats(self) -> Dict[str, int]:
@@ -2298,6 +2335,8 @@ class Database:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
+            day_start_utc, day_end_utc = self._current_stats_utc_window()
+
             # 1. 查询今日生成概况
             overview_cur = await db.execute("""
                 SELECT
@@ -2309,8 +2348,8 @@ class Database:
                     COUNT(CASE WHEN status_code >= 400 THEN 1 END) as total_fail,
                     COUNT(*) as total_requests
                 FROM request_logs
-                WHERE date(created_at, 'localtime') = date('now', 'localtime')
-            """)
+                WHERE created_at >= ? AND created_at < ?
+            """, (day_start_utc, day_end_utc))
             overview_row = await overview_cur.fetchone()
             overview = dict(overview_row) if overview_row else {}
 
@@ -2330,10 +2369,10 @@ class Database:
                     COUNT(*) as total_requests
                 FROM request_logs r
                 LEFT JOIN tokens t ON r.token_id = t.id
-                WHERE date(r.created_at, 'localtime') = date('now', 'localtime')
+                WHERE r.created_at >= ? AND r.created_at < ?
                 GROUP BY r.token_id
                 ORDER BY total_requests DESC
-            """)
+            """, (day_start_utc, day_end_utc))
             account_rows = await account_cur.fetchall()
             accounts_usage = [dict(row) for row in account_rows]
 
@@ -2351,8 +2390,8 @@ class Database:
                 SELECT request_body
                 FROM request_logs
                 WHERE operation = 'generate_video' AND status_code = 200
-                  AND date(created_at, 'localtime') = date('now', 'localtime')
-            """)
+                  AND created_at >= ? AND created_at < ?
+            """, (day_start_utc, day_end_utc))
             today_video_credits = 0
             for row in await video_logs_cursor.fetchall():
                 today_video_credits += self._estimate_video_credit_cost(row[0])

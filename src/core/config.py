@@ -65,6 +65,12 @@ class Config:
         return self._config
 
     @property
+    def stats_timezone(self) -> str:
+        """业务统计使用的 IANA 时区。"""
+        value = self._config.get("global", {}).get("stats_timezone", "Asia/Shanghai")
+        return str(value or "Asia/Shanghai").strip() or "Asia/Shanghai"
+
+    @property
     def admin_username(self) -> str:
         # If admin_username is set from database, use it; otherwise fall back to config file
         if self._admin_username is not None:

@@ -362,6 +362,50 @@ class SynchronousPendingBoundaryTests(GenerationBoundaryFixture):
             (503, "failed"),
         ])
 
+
+    async def test_successful_video_persists_upstream_remaining_credits(self):
+        self.flow.check_video_status = AsyncMock(return_value={
+            "remainingCredits": 90,
+            "operations": [{
+                "operation": {"name": "upstream-boundary"},
+                "mediaName": "media-boundary",
+                "projectId": "project-boundary",
+                "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+            }],
+        })
+        self.flow.get_media_url_redirect = AsyncMock(return_value="https://example.test/video.mp4")
+
+        with patch.object(self.manager, "refresh_credits", new=AsyncMock()) as refresh_credits:
+            result = [chunk async for chunk in self.handler.handle_generation(VIDEO_MODEL, "cat")]
+
+        self.assertIn("https://example.test/video.mp4", json.loads(result[-1])["choices"][0]["message"]["content"])
+        self.assertEqual((await self.db.get_token(self.token.id)).credits, 90)
+        refresh_credits.assert_not_awaited()
+
+    async def test_successful_video_refreshes_balance_when_upstream_omits_remaining_credits(self):
+        self.flow.check_video_status = AsyncMock(return_value={
+            "operations": [{
+                "operation": {"name": "upstream-boundary"},
+                "mediaName": "media-boundary",
+                "projectId": "project-boundary",
+                "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+            }],
+        })
+        self.flow.get_media_url_redirect = AsyncMock(return_value="https://example.test/video.mp4")
+        refreshed = asyncio.Event()
+
+        async def refresh_credits(token_id):
+            await self.db.update_token(token_id, credits=89)
+            refreshed.set()
+            return 89
+
+        with patch.object(self.manager, "refresh_credits", side_effect=refresh_credits) as refresh:
+            [chunk async for chunk in self.handler.handle_generation(VIDEO_MODEL, "cat")]
+            await asyncio.wait_for(refreshed.wait(), timeout=1)
+
+        refresh.assert_awaited_once_with(self.token.id)
+        self.assertEqual((await self.db.get_token(self.token.id)).credits, 89)
+
     async def test_normal_video_fallback_releases_each_owned_pending_slot(self):
         fallback = await self._add_fallback_token()
         attempt_tokens = []

@@ -2,6 +2,7 @@
 api_key = "han1234"
 admin_username = "admin"
 admin_password = "admin"
+stats_timezone = "Asia/Shanghai"
 
 [flow]
 labs_base_url = "https://labs.google/fx/api"
